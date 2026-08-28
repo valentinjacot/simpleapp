@@ -147,3 +147,39 @@ Findings:
   it did **not** occur here; `.venv/bin/alembic ...` worked directly. Noting this
   because the assumption turned out to be wrong for this setup rather than silently
   dropping it — if it ever does break elsewhere, `python -m alembic ...` is the fix.
+
+## Phase 4 results (session auth + security headers, last run: 2026-08-28)
+
+Tested with curl using a cookie jar (`-c`/`-b`) to carry the session cookie across
+requests, since auth is now cookie-based. Credential used for testing: a random
+password I generated and hashed myself (`APP_USERNAME=testuser` in `.env`) — I know
+this value, so it must be rotated via `scripts/hash_password.py` before real use.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `GET /` with no session | 307 redirect to `/login` | 307 |
+| 2 | `GET /api/entries` with no session | 401 | 401 |
+| 3 | `POST /login` wrong password | 401 | 401 |
+| 4 | `POST /login` wrong username | 401 | 401 |
+| 5 | `POST /login` correct credentials | 200, sets session cookie | 200 |
+| 6 | `GET /` with valid session cookie | 200 | 200 |
+| 7 | `GET /api/entries` with valid session cookie | 200, full list | 200 |
+| 8 | `POST /api/entries` with valid session cookie | 201 | 201 |
+| 9 | `POST /logout` | 200, clears session | 200 |
+| 10 | `GET /api/entries` after logout, same cookie | 401 again | 401 |
+
+All as expected — the full login → authenticated access → logout → 401-again
+lifecycle works.
+
+Findings:
+- `Set-Cookie` header confirmed: `httponly; samesite=lax` — cookie isn't readable
+  from JS (mitigates a stolen-cookie XSS scenario) and won't be sent on cross-site
+  requests except top-level navigation (mitigates classic CSRF). `https_only` is
+  intentionally off for now — this is plain HTTP until Phase 7 adds a reverse proxy.
+- Security headers confirmed present on responses: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: same-origin`.
+- Single-user by design (see `CLAUDE.md`): authz reduces to "must be logged in" —
+  there's exactly one account, so there's no per-resource permission check to test.
+- **Known gaps, not addressed this phase**: no rate limiting / brute-force protection
+  on `/login` (Phase 7 territory), no dependency vulnerability scanning, HTTPS still
+  absent (Phase 6/7 — reverse proxy + TLS termination).

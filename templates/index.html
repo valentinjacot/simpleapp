@@ -6,6 +6,7 @@
 </head>
 <body>
     <h1>Training Log</h1>
+    <button id="logout-button">Log out</button>
 
     <form id="entry-form">
         <label>Date <input type="date" name="date" required></label>
@@ -30,8 +31,17 @@
     </table>
 
     <script>
+        document.getElementById("logout-button").addEventListener("click", async () => {
+            await fetch("/logout", { method: "POST" });
+            window.location.href = "/login";
+        });
+
         async function loadEntries() {
             const res = await fetch("/api/entries");
+            if (res.status === 401) {
+                window.location.href = "/login";
+                return;
+            }
             const entries = await res.json();
             const body = document.getElementById("entries-body");
             body.innerHTML = "";
@@ -65,6 +75,10 @@
                 body: JSON.stringify(payload),
             });
 
+            if (res.status === 401) {
+                window.location.href = "/login";
+                return;
+            }
             if (!res.ok) {
                 const body = await res.json();
                 errorEl.textContent = "Error: " + JSON.stringify(body.detail);

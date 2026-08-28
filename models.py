@@ -12,3 +12,8 @@ class EntryCreate(BaseModel):
 
 class EntryOut(EntryCreate):
     id: int
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str

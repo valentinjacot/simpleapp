@@ -25,13 +25,16 @@ Optimize for MY understanding, not for shipping fast or being impressive.
 - Postgres 14 (installed natively, not Docker), SQLAlchemy 2.0 ORM, Alembic migrations
   — started on SQLite, swapped in Phase 3 on purpose
 - Plain HTML frontend, no JS framework
+- Single-user session-cookie auth (Starlette `SessionMiddleware` + stdlib `hashlib.scrypt`
+  for password hashing); secrets loaded from a gitignored `.env` via `python-dotenv`
+  (see `.env.example`)
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
 2. Split API layer (JSON endpoints) from frontend; add Pydantic validation — done 2026-08-28
 3. Data layer: SQLAlchemy ORM, swap to Postgres, Alembic migrations — done 2026-08-28
-4. [CURRENT] Security: env secrets, authn, authz, OWASP basics
-5. Observability: structured logs, OTel traces+metrics, health/readiness, export to Elastic
+4. Security: env secrets, authn, authz, OWASP basics — done 2026-08-28
+5. [CURRENT] Observability: structured logs, OTel traces+metrics, health/readiness, export to Elastic
 6. Packaging & deploy: Dockerfile → compose → k8s manifests → CI pipeline
 7. Hardening: 12-factor, rate limiting, graceful shutdown, reverse proxy, load test
 
@@ -78,3 +81,27 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   it are both gone now — schema creation is exclusively Alembic's job going forward
   (`alembic upgrade head`), not something the app does implicitly at boot. Local dev setup
   is now: `alembic upgrade head` once, then run the app as before. Phase 3 is complete.
+- **Phase 4, env secrets (done 2026-08-28)**: `DATABASE_URL`'s hardcoded local-dev fallback
+  (the known gap flagged in Phase 3) is gone — `db.py` now does `os.environ["DATABASE_URL"]`
+  (raises loudly if unset) after `load_dotenv()`. New `.env` (gitignored, real local secrets)
+  and `.env.example` (committed template, no real values). New dependency `python-dotenv` —
+  reads a local `.env` file into process env vars, standard/well-known, avoids needing to
+  `export` vars by hand every terminal session.
+- **Phase 4, authn + authz + OWASP basics (done 2026-08-28)**: added server-side session-cookie
+  login (Starlette's `SessionMiddleware`; new dependency `itsdangerous`, which it requires
+  for signing but doesn't bundle). Passwords hashed with stdlib `hashlib.scrypt` (salted,
+  matches common interactive-login KDF parameters) — no new dependency needed for hashing.
+  `auth.py` holds `hash_password`/`verify_password`/`require_login`; `scripts/hash_password.py`
+  is a one-off setup tool (uses `getpass`, never echoes or stores the password) to generate
+  `APP_PASSWORD_HASH` for `.env`. New routes `GET/POST /login`, `POST /logout`; `GET /` and
+  both `/api/entries` routes now require a valid session. **Single-user by design** (see
+  Purpose above — this is literally one person's training log, not a multi-tenant app), so
+  authz reduces to "must be logged in"; a production-grade version serving multiple users
+  would add a `users` table + `entries.user_id` FK and filter every query by the current
+  user, not just gate on "any valid session". OWASP-basics pass: XSS and SQL injection were
+  already mitigated (Phases 2–3); added CSRF mitigation via `SameSite=Lax` + `HttpOnly` on
+  the session cookie (confirmed in `Set-Cookie` header), and a small security-headers
+  middleware (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: same-origin`). Explicitly deferred, not forgotten: rate limiting /
+  brute-force protection on `/login` (Phase 7), HTTPS/TLS (Phase 6–7, needs a reverse
+  proxy), dependency vulnerability scanning. Phase 4 is complete.

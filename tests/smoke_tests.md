@@ -108,3 +108,42 @@ Findings:
   string `''` instead of an empty string (visible as `''''''::text` in `\d entries`).
   Fixed by wrapping it in `sqlalchemy.text("''")`, which SQLAlchemy treats as raw SQL.
   Confirmed via `CreateTable(Entry.__table__)` showing `DEFAULT ''` before applying.
+
+## Phase 3, Step B results (Alembic migrations, last run: 2026-08-28)
+
+Dropped Step A's `create_all()`-made table, ran
+`alembic revision --autogenerate -m "create entries table"`, read the generated file
+by hand before applying (`alembic/versions/be5629bbd1e8_create_entries_table.py` —
+correctly used `sa.text("''")` for the `notes` default, matching the earlier fix),
+then `alembic upgrade head`. `db.py`'s `init_db()` and `app.py`'s `db.init_db()`
+startup call were both removed — schema creation is Alembic's job now, not the app's.
+
+Re-ran the same 10-case suite once more against the migration-created table (after
+restarting the server with `init_db()` gone):
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `GET /api/entries` on empty db | 200, `[]` | 200 |
+| 2 | Normal entry | 201 | 201 |
+| 3 | Zero distance | 201 | 201 |
+| 4 | Zero duration | 201 | 201 |
+| 5 | Empty notes string | 201 | 201 |
+| 6 | Notes field omitted | 201 | 201 |
+| 7 | Both distance and duration zero | 201 | 201 |
+| 8 | Missing required field (`distance_km`) | 422 | 422 |
+| 9 | Negative distance | 422 | 422 |
+| 10 | Malformed date | 422 | 422 |
+
+All identical again. Verified via `psql`: `\d entries` matches Step A's schema
+exactly, `alembic_version` holds one row (`be5629bbd1e8`), `\dt` shows both tables,
+and `select count(*) from entries` returned 6 after the 6 valid POSTs.
+
+Findings:
+- Autogenerate correctly detected the whole table as new (`Detected added table
+  'entries'`) since it was dropped first — a genuine `CREATE TABLE` migration file
+  exists and was reviewed, not a blind `alembic stamp head` against a pre-existing table.
+- Expected an import gotcha (the plain `alembic` console-script not putting the repo
+  root on `sys.path`, breaking `alembic/env.py`'s `from db import DATABASE_URL`) —
+  it did **not** occur here; `.venv/bin/alembic ...` worked directly. Noting this
+  because the assumption turned out to be wrong for this setup rather than silently
+  dropping it — if it ever does break elsewhere, `python -m alembic ...` is the fix.

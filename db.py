@@ -3,7 +3,7 @@ import os
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from orm_models import Base, Entry
+from orm_models import Entry
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -12,10 +12,6 @@ DATABASE_URL = os.environ.get(
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
-
-
-def init_db():
-    Base.metadata.create_all(engine)
 
 
 def insert_entry(date, distance_km, duration_min, notes) -> int:

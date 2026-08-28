@@ -7,8 +7,6 @@ from models import EntryCreate, EntryOut
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-db.init_db()
-
 
 @app.get("/")
 def index(request: Request):

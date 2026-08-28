@@ -1,48 +1,43 @@
-import sqlite3
+import os
 
-DB_PATH = "log.db"
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
+from orm_models import Base, Entry
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg2://simpleapp:simpleapp_dev@localhost/simpleapp",
+)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def init_db():
-    conn = get_connection()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            distance_km REAL NOT NULL,
-            duration_min REAL NOT NULL,
-            notes TEXT
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+    Base.metadata.create_all(engine)
 
 
-def insert_entry(date: str, distance_km: float, duration_min: float, notes: str) -> int:
-    conn = get_connection()
-    cursor = conn.execute(
-        "INSERT INTO entries (date, distance_km, duration_min, notes) VALUES (?, ?, ?, ?)",
-        (date, distance_km, duration_min, notes),
-    )
-    conn.commit()
-    new_id = cursor.lastrowid
-    conn.close()
-    return new_id
+def insert_entry(date, distance_km, duration_min, notes) -> int:
+    with SessionLocal() as session:
+        entry = Entry(date=date, distance_km=distance_km, duration_min=duration_min, notes=notes)
+        session.add(entry)
+        session.commit()
+        return entry.id
 
 
 def get_all_entries():
-    conn = get_connection()
-    cursor = conn.execute(
-        "SELECT id, date, distance_km, duration_min, notes FROM entries ORDER BY date DESC, id DESC"
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(Entry).order_by(Entry.date.desc(), Entry.id.desc())
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "date": r.date,
+                "distance_km": r.distance_km,
+                "duration_min": r.duration_min,
+                "notes": r.notes,
+            }
+            for r in rows
+        ]

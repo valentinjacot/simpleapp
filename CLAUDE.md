@@ -27,8 +27,8 @@ Optimize for MY understanding, not for shipping fast or being impressive.
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
-2. [CURRENT] Split API layer (JSON endpoints) from frontend; add Pydantic validation
-3. Data layer: SQLAlchemy ORM, swap to Postgres, Alembic migrations
+2. Split API layer (JSON endpoints) from frontend; add Pydantic validation — done 2026-08-28
+3. [CURRENT] Data layer: SQLAlchemy ORM, swap to Postgres, Alembic migrations
 4. Security: env secrets, authn, authz, OWASP basics
 5. Observability: structured logs, OTel traces+metrics, health/readiness, export to Elastic
 6. Packaging & deploy: Dockerfile → compose → k8s manifests → CI pipeline
@@ -44,10 +44,28 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   `REAL NOT NULL`, so 0 is valid, not missing), empty/omitted notes both default to `""`,
   missing required form field correctly 422s. No code path could store a true SQL NULL —
   expected, since nothing was optional yet. See `tests/smoke_tests.md`.
-- **Phase 2 (in progress)**: added `GET/POST /api/entries` (JSON, Pydantic-validated) and
+- **Phase 2 (done 2026-08-28)**: added `GET/POST /api/entries` (JSON, Pydantic-validated) and
   switched `index.html` to a fetch-based client (vanilla JS, no framework) — the frontend
   is now a consumer of the API, not a privileged form-POST path. Old `POST /entries`
   form-encoded route removed; `python-multipart` dependency dropped since nothing parses
   multipart/form-data anymore. Added `ge=0` validation on distance/duration (previously
   unenforced by raw SQLite) and rendered the entries table via `textContent` rather than
   `innerHTML` to avoid an XSS hole from unescaped `notes` in client-side rendering.
+- **Phase 3, Step A (done 2026-08-28)**: swapped raw `sqlite3` for SQLAlchemy 2.0's typed
+  ORM (`Mapped`/`mapped_column`, not the legacy `Column()` style) against a natively
+  installed Postgres 14 (not Docker — that's Phase 6). New file `orm_models.py` holds the
+  `Entry` mapped class (`models.py` was already taken by the Pydantic schemas). `db.py`
+  keeps its exact same three function signatures, so `app.py` needed zero changes — the
+  ORM swap is entirely invisible above the data-access layer. `DATABASE_URL` is read from
+  an env var with a hardcoded local-dev fallback baked into source
+  (`postgresql+psycopg2://simpleapp:simpleapp_dev@localhost/simpleapp`) — intentionally
+  *not* real secrets management (no `.env`, no vault); that's Phase 4's job. Confirmed a
+  real win from the swap: Postgres's native `DATE` column type rejects a bad date literal
+  (`ERROR: invalid input syntax for type date`) that SQLite's untyped `TEXT` column would
+  have silently stored — a second line of defense below Pydantic's own validation. Also
+  hit and fixed a real bug: passing a bare Python string to `server_default` doesn't emit
+  raw SQL, it gets quoted as a literal value — `server_default="''"` actually stored the
+  literal 2-character string `''`, not an empty string. Fixed with `sqlalchemy.text("''")`.
+  Still-open gap, unchanged from Phase 2: nothing tests a true SQL `NULL` — `notes` is
+  non-NULL at both the ORM and now the DB level, but no optional fields exist anywhere yet.
+  Step B (Alembic migrations) is next, still within Phase 3.

@@ -72,3 +72,39 @@ Findings:
 - **Browser check (manual, 2026-08-28)**: clicked through `index.html` by hand —
   table loads via fetch on page load, form submit POSTs JSON to `/api/entries`
   and the new row appears without a full page reload. Confirmed working.
+
+## Phase 3, Step A results (SQLAlchemy ORM + Postgres, last run: 2026-08-28)
+
+Same 10-case suite from Phase 2, replayed against the Postgres-backed API (`db.py`
+now uses SQLAlchemy instead of raw `sqlite3`; `app.py`/`models.py` untouched).
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `GET /api/entries` on empty db | 200, `[]` | 200 |
+| 2 | Normal entry | 201 | 201 |
+| 3 | Zero distance | 201 | 201 |
+| 4 | Zero duration | 201 | 201 |
+| 5 | Empty notes string | 201 | 201 |
+| 6 | Notes field omitted | 201 | 201 |
+| 7 | Both distance and duration zero | 201 | 201 |
+| 8 | Missing required field (`distance_km`) | 422 | 422 |
+| 9 | Negative distance | 422 | 422 |
+| 10 | Malformed date | 422 | 422 |
+
+All identical to Phase 2 — the ORM swap changed the storage layer, not the API's
+behavior. Verified via `psql`: 6 rows, ids 1–6, no duplicates.
+
+Findings:
+- `\d entries` in Postgres: `date` is a real `date` column, `distance_km`/
+  `duration_min` are `double precision`, `notes` is `text not null default ''::text`
+  — all inferred automatically from the SQLAlchemy 2.0 `Mapped[...]` type hints.
+- Concrete SQLite → Postgres upgrade: inserting `'not-a-date'` directly via `psql`
+  is **rejected** (`ERROR: invalid input syntax for type date`). SQLite's `TEXT`
+  column would have silently stored it — Postgres's real `DATE` type catches it at
+  the database layer, a second line of defense below Pydantic's own validation.
+- **Bug caught during implementation**: passing a bare Python string to
+  `server_default` (e.g. `server_default="''"`) does NOT emit raw SQL — SQLAlchemy
+  quotes it as a literal *value*, so the actual stored default became the 2-character
+  string `''` instead of an empty string (visible as `''''''::text` in `\d entries`).
+  Fixed by wrapping it in `sqlalchemy.text("''")`, which SQLAlchemy treats as raw SQL.
+  Confirmed via `CreateTable(Entry.__table__)` showing `DEFAULT ''` before applying.

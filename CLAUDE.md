@@ -28,6 +28,8 @@ Optimize for MY understanding, not for shipping fast or being impressive.
 - Single-user session-cookie auth (Starlette `SessionMiddleware` + stdlib `hashlib.scrypt`
   for password hashing); secrets loaded from a gitignored `.env` via `python-dotenv`
   (see `.env.example`)
+- Structured JSON logging via stdlib `logging` + a custom formatter (`logging_config.py`)
+  — no logging library dependency
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
@@ -105,3 +107,20 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   `Referrer-Policy: same-origin`). Explicitly deferred, not forgotten: rate limiting /
   brute-force protection on `/login` (Phase 7), HTTPS/TLS (Phase 6–7, needs a reverse
   proxy), dependency vulnerability scanning. Phase 4 is complete.
+- **Phase 5, Step A (done 2026-09-04)**: structured JSON logging. New file
+  `logging_config.py` holds a stdlib `logging.Formatter` subclass (`JSONFormatter`) that
+  emits one JSON object per line — no new dependency, deliberately not
+  `python-json-logger` or similar, since stdlib `logging`'s `extra={...}` mechanism
+  already does everything needed here. `configure_logging()` (called once at startup in
+  `app.py`) also rewires uvicorn's own loggers (`uvicorn`, `uvicorn.error`,
+  `uvicorn.access`) onto the same handler so the whole process emits one consistent
+  format, not a mix of JSON and uvicorn's default colored text. A new `log_requests`
+  middleware logs every request (`http_method`, `path`, `status_code`, `duration_ms`);
+  `/login` and `/logout` additionally log `login_failed`/`login_succeeded` (with
+  `username`, deliberately never `password`) and `logout` events. **Caught during
+  testing**: uvicorn's own `uvicorn.access` logger was double-logging every request
+  alongside the new richer one — silenced it at `WARNING` level rather than leaving two
+  overlapping log lines per request. **Known gap, not addressed this step**: no
+  request/trace ID correlating log lines from the same request — arrives naturally with
+  Step C (OpenTelemetry), which generates trace/span IDs that can be attached to log
+  records. Log level configurable via `LOG_LEVEL` env var (default `INFO`).

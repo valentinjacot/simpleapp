@@ -183,3 +183,33 @@ Findings:
 - **Known gaps, not addressed this phase**: no rate limiting / brute-force protection
   on `/login` (Phase 7 territory), no dependency vulnerability scanning, HTTPS still
   absent (Phase 6/7 — reverse proxy + TLS termination).
+
+## Phase 5, Step A results (structured JSON logging, last run: 2026-09-04)
+
+Restarted the server and exercised the same auth flow used in Phase 4's table, this
+time inspecting stdout for structured log lines instead of just HTTP status codes.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `GET /api/entries` with no session | `request` log, `status_code: 401` | present |
+| 2 | `POST /login` wrong password | `login_failed` log with `username`, no password field anywhere | present |
+| 3 | `POST /login` correct credentials | `login_succeeded` log with `username` | present |
+| 4 | `GET /api/entries` with valid session | `request` log, `status_code: 200`, `duration_ms` present | present |
+| 5 | `POST /logout` | `logout` log, then `request` log for the same call | present |
+| 6 | Server startup | uvicorn's own startup lines are JSON too (not the default colored text) | present |
+
+Findings:
+- Every line on stdout is one JSON object (`logging_config.py`'s `JSONFormatter`) —
+  `timestamp`, `level`, `logger`, `message`, plus whatever's passed via `extra={...}`.
+  No new dependency: built on stdlib `logging`, not `python-json-logger` or similar.
+- Uvicorn's own loggers (`uvicorn`, `uvicorn.error`, `uvicorn.access`) are rewired to
+  the same JSON handler so the whole process emits one consistent format.
+- **Caught and fixed during testing**: `uvicorn.access` was double-logging every
+  request (its own plain-text access line alongside our richer `request` log, which
+  already includes `duration_ms`). Silenced `uvicorn.access` at `WARNING` level in
+  `logging_config.py` rather than living with the duplicate.
+- Confirmed by inspection: `login_failed` logs the attempted `username` but the
+  request body's `password` field never appears anywhere in the log output.
+- **Known gap, not addressed this step**: no request/trace ID correlating a single
+  request across log lines yet — arrives naturally with Step C (OTel), which
+  generates trace/span IDs that can be attached to log records.

@@ -1,4 +1,6 @@
+import logging
 import os
+import time
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -8,9 +10,12 @@ from starlette.middleware.sessions import SessionMiddleware
 
 import db
 from auth import require_login, verify_password
+from logging_config import configure_logging
 from models import EntryCreate, EntryOut, LoginRequest
 
 load_dotenv()
+configure_logging()
+logger = logging.getLogger("simpleapp")
 
 APP_USERNAME = os.environ["APP_USERNAME"]
 APP_PASSWORD_HASH = os.environ["APP_PASSWORD_HASH"]
@@ -32,6 +37,23 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    logger.info(
+        "request",
+        extra={
+            "http_method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
+    return response
+
+
 @app.get("/login")
 def login_page(request: Request):
     if request.session.get("authenticated"):
@@ -45,14 +67,18 @@ def login(credentials: LoginRequest, request: Request):
         credentials.password, APP_PASSWORD_HASH
     )
     if not valid:
+        # Log the attempted username, never the password.
+        logger.warning("login_failed", extra={"username": credentials.username})
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
     request.session["authenticated"] = True
+    logger.info("login_succeeded", extra={"username": credentials.username})
     return {"ok": True}
 
 
 @app.post("/logout")
 def logout(request: Request):
     request.session.clear()
+    logger.info("logout")
     return {"ok": True}
 
 

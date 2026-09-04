@@ -3,9 +3,22 @@ import logging
 import os
 import sys
 
+from opentelemetry import trace
+
 # Attributes every stdlib LogRecord carries. Anything else on a record came from
 # our own `extra={...}` calls and should be surfaced as a JSON field.
 _STANDARD_RECORD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__)
+
+
+# Attaches the active span's trace_id/span_id to each log record, correlating a
+# log line back to the OTel trace that produced it.
+class TraceContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        span_context = trace.get_current_span().get_span_context()
+        if span_context.is_valid:
+            record.trace_id = format(span_context.trace_id, "032x")
+            record.span_id = format(span_context.span_id, "016x")
+        return True
 
 
 class JSONFormatter(logging.Formatter):
@@ -28,6 +41,7 @@ def configure_logging() -> None:
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter())
+    handler.addFilter(TraceContextFilter())
 
     root = logging.getLogger()
     root.setLevel(level)

@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -12,16 +13,26 @@ import db
 from auth import require_login, verify_password
 from logging_config import configure_logging
 from models import EntryCreate, EntryOut, LoginRequest
+from otel_setup import configure_telemetry, instrument_app, instrument_engine, shutdown_telemetry
 
 load_dotenv()
 configure_logging()
 logger = logging.getLogger("simpleapp")
+configure_telemetry()
+instrument_engine(db.engine)
 
 APP_USERNAME = os.environ["APP_USERNAME"]
 APP_PASSWORD_HASH = os.environ["APP_PASSWORD_HASH"]
 SESSION_SECRET_KEY = os.environ["SESSION_SECRET_KEY"]
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    shutdown_telemetry()
+
+
+app = FastAPI(lifespan=lifespan)
+instrument_app(app)
 # https_only=False: this app is plain HTTP for now (no TLS/reverse proxy yet —
 # that's Phase 7). Revisit once HTTPS is in place.
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY, same_site="lax", https_only=False)

@@ -30,6 +30,9 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   (see `.env.example`)
 - Structured JSON logging via stdlib `logging` + a custom formatter (`logging_config.py`)
   — no logging library dependency
+- OpenTelemetry SDK for traces + metrics (`otel_setup.py`); auto-instrumentation for
+  FastAPI and SQLAlchemy; console exporters for now (real backend export is Phase 5
+  Step D)
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
@@ -137,3 +140,29 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   failed liveness but only pulls it from rotation on failed readiness — worth having
   two separate endpoints rather than one, even though right now nothing consumes them
   (that's Phase 6's job, once there's a container/orchestrator to wire them into).
+- **Phase 5, Step C (done 2026-09-04)**: OpenTelemetry traces + metrics. New file
+  `otel_setup.py`; new dependencies `opentelemetry-sdk`,
+  `opentelemetry-instrumentation-fastapi`, `opentelemetry-instrumentation-sqlalchemy`
+  (all well-known, official OTel Python packages). `FastAPIInstrumentor` and
+  `SQLAlchemyInstrumentor` auto-instrument every route and every DB query — no manual
+  span creation in `app.py`/`db.py` — so a single request's trace shows a parent
+  request span with a child DB-query span nested inside it, making "how much of this
+  request's time was the database" visible without writing any tracing code by hand.
+  Metrics (`http.server.duration`, request counts, etc.) come from the same SDK's
+  meter provider. Both exporters are **console exporters** for this step deliberately
+  — no Collector or Elastic endpoint exists yet (that's Step D); the exporter is
+  isolated to two lines in `otel_setup.py` so swapping it for a real OTLP endpoint
+  later is a config change, not a redesign. Also closed a gap flagged in Step A: a new
+  `TraceContextFilter` (`logging_config.py`) attaches the active span's `trace_id`/
+  `span_id` to every JSON log line, so a log line can be correlated back to its trace —
+  confirmed by direct comparison that the values match exactly.
+  **Bug caught during implementation**: `FastAPI.add_event_handler("shutdown", ...)` —
+  the initial approach for flushing telemetry on shutdown — doesn't exist on this
+  project's FastAPI version (0.141.1); that whole `on_event`/`add_event_handler` API
+  was removed in favor of the `lifespan` context-manager parameter. Fixed by passing
+  `lifespan=lifespan` to `FastAPI()`. **Trade-offs noted, not "fixed"** (right choice
+  for this app's scale, not for production): `SimpleSpanProcessor` (synchronous
+  per-span export) instead of `BatchSpanProcessor`, and a 5s metrics-export interval
+  instead of the SDK's 60s default — both purely for fast local-testing feedback; a
+  production-grade version would batch spans and use a longer export interval to cut
+  overhead under real load.

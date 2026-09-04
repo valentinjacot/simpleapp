@@ -6,3 +6,6 @@ psycopg2-binary
 alembic
 python-dotenv
 itsdangerous
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-sqlalchemy

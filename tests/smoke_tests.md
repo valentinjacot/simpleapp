@@ -242,3 +242,46 @@ Findings:
   captured, not just a generic 503.
 - Both probes are unauthenticated by design, unlike every other route. No new attack
   surface: they reveal only "up" / "up and DB-reachable", nothing else.
+
+## Phase 5, Step C results (OpenTelemetry traces + metrics, last run: 2026-09-04)
+
+Restarted the server, exercised `POST /login` then `GET /api/entries` then
+`GET /readyz`, and inspected stdout for span/metric output (`ConsoleSpanExporter` /
+`ConsoleMetricExporter` — both print pretty-printed JSON directly to stdout,
+interleaved with the app's own single-line JSON logs).
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `POST /login` | a `POST /login` span, `SpanKind.SERVER` | present |
+| 2 | `GET /api/entries` | a `GET /api/entries` span, plus a child `SELECT simpleapp` span from the SQLAlchemy instrumentation | present |
+| 3 | `login_succeeded` log line during an active span | log line carries `trace_id`/`span_id` matching the active span's | present, matched |
+| 4 | Metrics export (every 5s) | `http.server.duration`, `http.server.active_requests`, `http.server.request.size`, `http.server.response.size` | all present |
+| 5 | `GET /readyz` | traced like any other route (DB check span appears as a child) | present |
+| 6 | Clean shutdown (`kill` the process) | no errors; `shutdown_telemetry()` flushes providers via the FastAPI `lifespan` context | clean, no errors in log |
+
+Findings:
+- Span nesting confirmed: a request span (`GET /api/entries`) is the parent of the DB
+  query span (`SELECT simpleapp`) — a single trace shows exactly how much of the
+  request's total time was spent in the database vs. elsewhere, without any manual
+  instrumentation in `db.py` or `app.py`. This is auto-instrumentation
+  (`FastAPIInstrumentor`, `SQLAlchemyInstrumentor`) doing its job.
+- Log/trace correlation confirmed by direct comparison: the `trace_id`/`span_id`
+  attached to a log line via `TraceContextFilter` (`logging_config.py`) match the
+  `context.trace_id`/`context.span_id` on the corresponding span exactly (same hex
+  value, modulo the `0x` prefix the span JSON adds). Closes the gap flagged in Step A.
+- **Deliberate scope for this step**: exporting to the console, not a real backend —
+  no Collector or Elastic endpoint exists yet (Step D). `otel_setup.py` isolates the
+  exporter choice to two lines (`ConsoleSpanExporter()`, `ConsoleMetricExporter()`),
+  so Step D is a config swap, not a redesign.
+- **Bug caught during implementation**: `FastAPI.add_event_handler("shutdown", ...)`
+  (used for the initial shutdown-flush attempt) doesn't exist on this project's
+  installed FastAPI version (0.141.1) — that whole `on_event`/`add_event_handler` API
+  was removed in favor of the `lifespan` context-manager parameter. Fixed by passing
+  `lifespan=lifespan` to `FastAPI()` instead; confirmed via a clean `kill` that
+  `shutdown_telemetry()` still runs (no errors, no leftover process).
+- **Trade-off noted, not fixed**: `SimpleSpanProcessor` (synchronous, per-span export)
+  instead of `BatchSpanProcessor` — right choice for this trivial app's traffic
+  volume; a production-grade version would batch to reduce exporter overhead under
+  real load. Also noted: metrics export interval was shortened to 5s from the SDK's
+  60s default purely for local-testing convenience — a production deployment would
+  leave it at (or near) the default.

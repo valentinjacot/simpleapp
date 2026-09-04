@@ -124,3 +124,16 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   request/trace ID correlating log lines from the same request — arrives naturally with
   Step C (OpenTelemetry), which generates trace/span IDs that can be attached to log
   records. Log level configurable via `LOG_LEVEL` env var (default `INFO`).
+- **Phase 5, Step B (done 2026-09-04)**: `GET /healthz` (liveness) and `GET /readyz`
+  (readiness) endpoints, both unauthenticated — an orchestrator's probe has no session
+  cookie. `/healthz` only confirms the process can respond; it never touches the
+  database, so a DB outage doesn't make a healthy process look dead. `/readyz` calls a
+  new `db.ping()` (`SELECT 1`) and returns 503 if that fails — this is the one an
+  orchestrator would gate load-balancer traffic on. Tested the failure path by pointing
+  a second, throwaway uvicorn process at an unreachable port via an env var override,
+  without touching the real local Postgres or `.env` (stopping the actual service needs
+  `sudo`, unavailable non-interactively in this environment). Confirms the standard
+  liveness-vs-readiness distinction: a production orchestrator restarts a container on
+  failed liveness but only pulls it from rotation on failed readiness — worth having
+  two separate endpoints rather than one, even though right now nothing consumes them
+  (that's Phase 6's job, once there's a container/orchestrator to wire them into).

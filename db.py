@@ -1,7 +1,7 @@
 import os
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
 from orm_models import Entry
@@ -12,6 +12,12 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def ping() -> None:
+    """Raises if the database is unreachable. Used by the /readyz probe."""
+    with SessionLocal() as session:
+        session.execute(text("SELECT 1"))
 
 
 def insert_entry(date, distance_km, duration_min, notes) -> int:

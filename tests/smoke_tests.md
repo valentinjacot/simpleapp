@@ -213,3 +213,32 @@ Findings:
 - **Known gap, not addressed this step**: no request/trace ID correlating a single
   request across log lines yet — arrives naturally with Step C (OTel), which
   generates trace/span IDs that can be attached to log records.
+
+## Phase 5, Step B results (health/readiness endpoints, last run: 2026-09-04)
+
+`/healthz` and `/readyz` are both unauthenticated (standard for orchestrator probes —
+a kubelet doesn't have a session cookie). Tested with the DB reachable, then again
+with a second uvicorn instance on port 8001 pointed at an unreachable port
+(`DATABASE_URL` overridden via env var for that one process only — the real local
+Postgres and `.env` were never touched) to force the `/readyz` failure path without
+needing `sudo` to actually stop Postgres.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `GET /healthz`, DB reachable | 200, `{"status": "ok"}` | 200 |
+| 2 | `GET /readyz`, DB reachable | 200, `{"status": "ok"}` | 200 |
+| 3 | `GET /healthz`, DB unreachable | 200 — liveness must not depend on the DB | 200 |
+| 4 | `GET /readyz`, DB unreachable | 503, `{"detail": "Database unreachable"}` | 503 |
+
+Findings:
+- The DB-down test confirms the intended split: `/healthz` answers "is the process
+  alive" and never touches the database; `/readyz` answers "can this instance
+  actually serve requests" via `db.ping()` (`SELECT 1`). A real orchestrator restarts
+  a pod on failed liveness but only pulls it from the load-balancer pool on failed
+  readiness — conflating the two would cause unnecessary restarts during a transient
+  DB blip.
+- `/readyz`'s failure path logs the full exception traceback (`logger.exception`) —
+  confirmed the real `psycopg2.OperationalError` reason ("Connection refused") is
+  captured, not just a generic 503.
+- Both probes are unauthenticated by design, unlike every other route. No new attack
+  surface: they reveal only "up" / "up and DB-reachable", nothing else.

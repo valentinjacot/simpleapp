@@ -54,6 +54,23 @@ async def log_requests(request: Request, call_next):
     return response
 
 
+@app.get("/healthz")
+def healthz():
+    """Liveness: is the process up and able to respond at all. No dependency checks."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    """Readiness: is the process able to serve real traffic (i.e. reach the DB)."""
+    try:
+        db.ping()
+    except Exception:
+        logger.exception("readyz_failed")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unreachable")
+    return {"status": "ok"}
+
+
 @app.get("/login")
 def login_page(request: Request):
     if request.session.get("authenticated"):

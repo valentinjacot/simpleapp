@@ -1,0 +1,245 @@
+# Runbook — Learning-Log
+
+Operational guide: how to start the app, exercise every endpoint from the terminal,
+read its logs/traces/metrics, and a plain-English summary of why the app is built the
+way it is. For the detailed, phase-by-phase history of *how* each decision was made
+and tested, see `CLAUDE.md`'s Phase notes and `tests/smoke_tests.md`.
+
+All commands below assume you're in the project root (`/home/jacotdev/claude/simpleapp`)
+with the virtualenv already created at `.venv/`.
+
+---
+
+## 1. One-time setup
+
+```bash
+.venv/bin/pip install -r requirements.txt
+
+# Postgres 14 must already be running natively (not Docker — that's Phase 6) with the
+# simpleapp role/db created. See CLAUDE.md's Phase 3 notes if that's not done yet.
+
+cp .env.example .env
+# Fill in .env:
+#   DATABASE_URL        — postgresql+psycopg2://simpleapp:simpleapp_dev@localhost/simpleapp
+#   SESSION_SECRET_KEY  — python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+#   APP_USERNAME         — pick anything, e.g. your name
+#   APP_PASSWORD_HASH    — .venv/bin/python scripts/hash_password.py (prompts via getpass,
+#                          never echoes or stores the plaintext password anywhere)
+
+.venv/bin/alembic upgrade head   # creates the entries table; only needed once, or after
+                                  # a new migration is added
+```
+
+## 2. Starting the app
+
+```bash
+.venv/bin/uvicorn app:app --reload
+```
+
+A clean startup looks like this (every line is one JSON object, see §5):
+
+```json
+{"timestamp": "...", "level": "INFO", "logger": "uvicorn.error", "message": "Started server process [PID]"}
+{"timestamp": "...", "level": "INFO", "logger": "uvicorn.error", "message": "Application startup complete."}
+{"timestamp": "...", "level": "INFO", "logger": "uvicorn.error", "message": "Uvicorn running on http://127.0.0.1:8000 ..."}
+```
+
+To stop it: `Ctrl-C` in that terminal, or from elsewhere:
+`pkill -f "uvicorn app:app"`.
+
+**If the port's already taken** (`Address already in use`), an old instance is still
+running — find and kill it first: `pgrep -fa "uvicorn app:app"` then `kill <pid>`.
+
+## 3. First checks: is it alive?
+
+Two separate probes, on purpose (see §9 for why):
+
+```bash
+curl -i http://127.0.0.1:8000/healthz   # liveness — "is the process up at all"
+curl -i http://127.0.0.1:8000/readyz    # readiness — "can it actually reach the DB"
+```
+
+Both unauthenticated, both should return `200 {"status": "ok"}` when everything's
+healthy. `/readyz` returns `503 {"detail": "Database unreachable"}` if Postgres is
+down — try it while Postgres is stopped to see the difference.
+
+## 4. Using the app from the terminal
+
+Everything except `/healthz`, `/readyz`, `/login`, and static pages requires a valid
+session cookie. Use a curl cookie jar to carry it across requests:
+
+```bash
+COOKIES=$(mktemp)
+
+# Log in
+curl -s -c "$COOKIES" -X POST http://127.0.0.1:8000/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"<APP_USERNAME>","password":"<your password>"}'
+# -> {"ok": true}   (401 if wrong)
+
+# List entries
+curl -s -b "$COOKIES" http://127.0.0.1:8000/api/entries | jq
+
+# Add an entry
+curl -s -b "$COOKIES" -X POST http://127.0.0.1:8000/api/entries \
+  -H "Content-Type: application/json" \
+  -d '{"date":"2026-09-04","distance_km":5.2,"duration_min":28,"notes":"easy run"}'
+# -> 201, the created entry with its new id
+
+# Log out (-c as well as -b: the response clears the cookie, and the jar must be
+# rewritten with that cleared value, or the old authenticated cookie lingers)
+curl -s -b "$COOKIES" -c "$COOKIES" -X POST http://127.0.0.1:8000/logout
+# -> {"ok": true}; the same jar now gets 401 on /api/entries
+
+rm -f "$COOKIES"
+```
+
+Or just use a browser: visit `http://127.0.0.1:8000/` — it redirects to `/login` if
+you're not authenticated, and the page itself is a plain HTML form talking to the same
+JSON API via `fetch`.
+
+## 5. Reading the structured logs
+
+Every log line the process writes — the app's own and uvicorn's — is a single JSON
+object on stdout (`logging_config.py`). Nothing is written to a file by default; it's
+all just process stdout, which you'd normally redirect or pipe to a log collector.
+
+```bash
+# Pretty-print as it streams
+.venv/bin/uvicorn app:app 2>&1 | jq .
+
+# Or redirect to a file and filter after the fact
+.venv/bin/uvicorn app:app > app.log 2>&1 &
+tail -f app.log | jq .
+
+# Only errors/warnings
+jq 'select(.level == "WARNING" or .level == "ERROR")' app.log
+
+# Only request logs, compact view
+jq -c 'select(.message == "request") | {path, status_code, duration_ms}' app.log
+
+# Failed login attempts (never shows the password — see auth.py)
+jq 'select(.message == "login_failed")' app.log
+```
+
+`LOG_LEVEL` env var controls verbosity (default `INFO`):
+`LOG_LEVEL=DEBUG .venv/bin/uvicorn app:app`.
+
+Every request produces one `"message": "request"` line with `http_method`, `path`,
+`status_code`, `duration_ms`. Login/logout produce their own `login_succeeded` /
+`login_failed` / `logout` lines with `username` (never `password`).
+
+## 6. Reading traces and metrics from the terminal
+
+OpenTelemetry is wired up (`otel_setup.py`) but currently exports to the **console**,
+not a real backend (Elastic export is Phase 6) — so traces/metrics show up as
+pretty-printed multi-line JSON blocks on the same stdout, interleaved with the
+single-line logs from §5. This makes them easy to eyeball locally but not yet
+searchable the way a real backend would let you.
+
+```bash
+# Find a specific request's trace (span names match "<METHOD> <path>")
+grep -A 40 '"name": "GET /api/entries"' app.log
+
+# See the DB query span nested under it — SQLAlchemy auto-instrumentation
+grep -A 15 '"name": "SELECT simpleapp"' app.log
+
+# Correlate a log line back to its trace: every log line carries trace_id/span_id
+# when it was logged during an active request. Grab one, then search for it in the
+# span output (strip any 0x prefix — spans print it, logs don't):
+jq -r 'select(.message == "login_succeeded") | .trace_id' app.log | tail -1
+grep -B5 -A30 "<paste the trace_id here>" app.log
+
+# Metrics are exported every 5s as a batch (shortened from the SDK's 60s default,
+# purely for fast local feedback — see CLAUDE.md's Step C note)
+grep -A5 '"name": "http.server.duration"' app.log
+```
+
+**Read this literally, not as searchable telemetry**: there's no query language, no
+retention policy, no dashboard — it's `grep`/`jq` over a live stream. That's the
+deliberate, temporary scope of Step C; Phase 6 replaces the console exporters with
+real OTLP export to an OTel Collector → Elasticsearch, at which point you'd use
+Kibana/APM instead of `grep`.
+
+## 7. Full smoke-test walkthrough
+
+A condensed version of the full test suite kept in `tests/smoke_tests.md` (which has
+the authoritative, dated results table per phase). Re-run this after any change to
+confirm nothing regressed:
+
+```bash
+COOKIES=$(mktemp)
+
+curl -s -o /dev/null -w "no session -> %{http_code}\n" http://127.0.0.1:8000/api/entries            # expect 401
+curl -s -o /dev/null -w "healthz -> %{http_code}\n" http://127.0.0.1:8000/healthz                    # expect 200
+curl -s -o /dev/null -w "readyz -> %{http_code}\n" http://127.0.0.1:8000/readyz                      # expect 200
+
+curl -s -c "$COOKIES" -o /dev/null -w "wrong password -> %{http_code}\n" -X POST http://127.0.0.1:8000/login \
+  -H "Content-Type: application/json" -d '{"username":"x","password":"wrong"}'                       # expect 401
+
+curl -s -c "$COOKIES" -o /dev/null -w "login -> %{http_code}\n" -X POST http://127.0.0.1:8000/login \
+  -H "Content-Type: application/json" -d '{"username":"<APP_USERNAME>","password":"<password>"}'     # expect 200
+
+curl -s -b "$COOKIES" -o /dev/null -w "list entries -> %{http_code}\n" http://127.0.0.1:8000/api/entries  # expect 200
+
+curl -s -b "$COOKIES" -o /dev/null -w "negative distance -> %{http_code}\n" -X POST http://127.0.0.1:8000/api/entries \
+  -H "Content-Type: application/json" -d '{"date":"2026-09-04","distance_km":-5,"duration_min":10,"notes":""}'  # expect 422
+
+curl -s -b "$COOKIES" -o /dev/null -w "bad date -> %{http_code}\n" -X POST http://127.0.0.1:8000/api/entries \
+  -H "Content-Type: application/json" -d '{"date":"not-a-date","distance_km":5,"duration_min":10,"notes":""}'   # expect 422
+
+curl -s -b "$COOKIES" -c "$COOKIES" -o /dev/null -w "logout -> %{http_code}\n" -X POST http://127.0.0.1:8000/logout  # expect 200
+curl -s -b "$COOKIES" -o /dev/null -w "after logout -> %{http_code}\n" http://127.0.0.1:8000/api/entries  # expect 401
+
+rm -f "$COOKIES"
+```
+
+## 8. Troubleshooting
+
+- **`Address already in use`**: a previous uvicorn instance is still running.
+  `pgrep -fa "uvicorn app:app"` to find it, `kill <pid>`.
+- **`KeyError` on `DATABASE_URL`/`APP_USERNAME`/etc. at startup**: `.env` is missing or
+  incomplete — these are read via `os.environ[...]` (raises loudly), not `.get()` with
+  a fallback, deliberately (Phase 4 — no silent fallback to a guessable default).
+- **`/readyz` returns 503**: Postgres isn't reachable. Check it's running
+  (`pg_lsclusters`, or `systemctl status postgresql` if you have sudo in that
+  terminal) and that `DATABASE_URL` in `.env` matches the real role/db/password.
+- **Managing the Postgres service itself** (start/stop/restart) needs `sudo`, which
+  doesn't work non-interactively in some environments (e.g. an AI coding assistant's
+  sandboxed terminal — no TTY for the password prompt) — run those specific commands
+  in your own regular terminal.
+- **Alembic can't find `DATABASE_URL`**: run it as `.venv/bin/alembic ...` from the
+  project root, not from another directory — `alembic/env.py` imports the app's own
+  `db.py`, which needs the repo root on `sys.path`.
+
+---
+
+## 9. Why it's built this way — choices, trade-offs, alternatives
+
+Plain-English summary. This is a **learning project** (see `CLAUDE.md`'s Purpose) —
+several choices below deliberately favor "see how the real thing works" over "fastest
+way to ship," which is called out explicitly where relevant.
+
+| Choice | Why | Advantage | Drawback / what production would add |
+|---|---|---|---|
+| **Postgres over SQLite** (Phase 3) | Roadmap goal: learn a real client-server DB, not just a file format | Real types (`DATE` rejects bad literals SQLite would silently store), concurrent access, matches how most production apps run | Needs a running service, not just a file — more moving parts for a trivial app |
+| **SQLAlchemy 2.0 typed ORM** | Standard, well-known Python ORM; typed `Mapped[...]` is current best practice | No hand-written SQL, DB-agnostic query layer, IDE type-checking on models | A thin wrapper over raw SQL/`psycopg2` would've been less code for something this small — the ORM earns its keep once the schema grows |
+| **Alembic migrations** (not `create_all()`) | `create_all()` can't express schema *changes*, only initial creation | Every schema change is a reviewable, versioned file; `alembic upgrade head` is the same command whether it's the 1st or 50th migration | One more tool/command to learn; overkill if the schema never changes again |
+| **Session-cookie auth** (Starlette `SessionMiddleware`) over JWT/OAuth | Simplest thing that's still real server-side auth; single-user app has no need for stateless tokens across services | No token-refresh logic, no client-side token storage to secure, server can invalidate a session instantly | Doesn't scale to multiple backend instances without a shared session store (Redis, etc.) — fine here, wouldn't be at scale |
+| **`hashlib.scrypt`** for password hashing | Stdlib, no new dependency, real memory-hard KDF (same family as bcrypt/argon2) | One less third-party dependency to trust/patch | A dedicated library (`argon2-cffi`, `passlib`) would auto-tune parameters and handle hash-format migration over time — hand-rolled here purely for the learning value |
+| **Single-user design** | This literally is one person's training log (see `CLAUDE.md` Purpose) | Authz collapses to "must be logged in" — no per-resource permission logic to get wrong | Not multi-tenant: no `users` table, no `entries.user_id` FK, no per-user data isolation — would need adding before a second real user ever touched it |
+| **`SameSite=Lax` + `HttpOnly` cookie, security headers** (Phase 4) | Standard, low-effort CSRF/XSS/clickjacking mitigations that don't need a library | Meaningful protection for near-zero code | Not a substitute for rate limiting on `/login` (still absent, deferred to Phase 7) or HTTPS (deferred to Phase 6/7 — needs a reverse proxy) |
+| **Stdlib `logging` + custom JSON formatter** over a logging library | `extra={...}` already does everything needed; one less dependency | Full control, no library API to learn, easy to read (`logging_config.py` is ~45 lines) | A library like `structlog` would add contextvars-based automatic context propagation (e.g. request ID threaded through without passing it explicitly everywhere) |
+| **OTel auto-instrumentation + console exporters** (Phase 5, Step C) | Auto-instrumentation (`FastAPIInstrumentor`, `SQLAlchemyInstrumentor`) needs zero manual span code; console output needs no backend to stand up yet | See a real trace (request span → nested DB-query span) and real metrics locally, immediately, with no infrastructure | Console output isn't searchable, isn't retained, and isn't what you'd actually run — it's a deliberate stepping stone to real OTLP export (Phase 6) |
+| **Native installs, not Docker** (Postgres in Phase 3, deferred Elastic stack) | Docker is explicitly a later phase (6) on the roadmap — the point is to first understand what's *inside* the container before automating it away | Forces understanding of what a real install/service/`systemd` unit actually involves | More manual setup steps now (e.g. `sudo` role creation) that Compose will make closer to one command in Phase 6 |
+| **Elastic export deferred to Phase 6** (not done in Phase 5) | Running Elasticsearch (+Kibana +Collector) natively is heavy (~2GB+ RAM, several `sudo` steps) for something that becomes near-free as Compose services next phase | Avoids doing real infrastructure work twice (once native, then redone in containers) | Phase 5's traces/metrics/logs are console-only until Phase 6 — not yet centrally searchable |
+
+### Known gaps, deferred on purpose (not forgotten)
+
+- No rate limiting / brute-force protection on `/login` — Phase 7.
+- No HTTPS/TLS — needs a reverse proxy, Phase 6/7.
+- No dependency vulnerability scanning.
+- No true SQL `NULL` tested anywhere — `notes` is non-NULL at both ORM and DB level;
+  every other field is required. No optional-field design exists yet.
+- Elastic export, Docker/Compose, k8s manifests, CI — Phase 6.
+- Graceful shutdown beyond OTel flush, 12-factor config review, load testing — Phase 7.

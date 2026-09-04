@@ -31,16 +31,18 @@ Optimize for MY understanding, not for shipping fast or being impressive.
 - Structured JSON logging via stdlib `logging` + a custom formatter (`logging_config.py`)
   — no logging library dependency
 - OpenTelemetry SDK for traces + metrics (`otel_setup.py`); auto-instrumentation for
-  FastAPI and SQLAlchemy; console exporters for now (real backend export is Phase 5
-  Step D)
+  FastAPI and SQLAlchemy; console exporters for now (real backend export deferred to
+  Phase 6, alongside Elasticsearch/Kibana/Collector as compose services)
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
 2. Split API layer (JSON endpoints) from frontend; add Pydantic validation — done 2026-08-28
 3. Data layer: SQLAlchemy ORM, swap to Postgres, Alembic migrations — done 2026-08-28
 4. Security: env secrets, authn, authz, OWASP basics — done 2026-08-28
-5. [CURRENT] Observability: structured logs, OTel traces+metrics, health/readiness, export to Elastic
-6. Packaging & deploy: Dockerfile → compose → k8s manifests → CI pipeline
+5. Observability: structured logs, OTel traces+metrics, health/readiness — done 2026-09-04
+   (export to Elastic deferred to Phase 6, see phase notes)
+6. [CURRENT] Packaging & deploy: Dockerfile → compose (app + Postgres + Elasticsearch +
+   Kibana + OTel Collector) → k8s manifests → CI pipeline
 7. Hardening: 12-factor, rate limiting, graceful shutdown, reverse proxy, load test
 
 ## Conventions
@@ -166,3 +168,17 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   instead of the SDK's 60s default — both purely for fast local-testing feedback; a
   production-grade version would batch spans and use a longer export interval to cut
   overhead under real load.
+- **Phase 5 closed, Step D deferred to Phase 6 (decided 2026-09-04)**: originally
+  scoped as this phase's Step D ("export to Elastic"), pushed to Phase 6 instead —
+  running Elasticsearch (+ Kibana, + an OTel Collector to receive OTLP and forward
+  into it) natively, the pattern used for Postgres in Phase 3, is a much heavier
+  install (Elasticsearch wants ~2GB+ RAM out of the box, plus a few `sudo` steps) for
+  something that becomes nearly free once Docker Compose exists — spinning up
+  Elasticsearch/Kibana/Collector as compose services next phase avoids doing the
+  native-install work now just to redo it in containers immediately after. Phase 5 is
+  otherwise complete: structured JSON logs (Step A), health/readiness endpoints
+  (Step B), and OTel traces+metrics with console exporters (Step C) are all working
+  and tested — see `tests/smoke_tests.md`. When Phase 6 adds Elasticsearch, the actual
+  export wiring should be small: `otel_setup.py`'s exporters are already isolated to
+  two lines, swapping `ConsoleSpanExporter`/`ConsoleMetricExporter` for OTLP exporters
+  pointed at the Collector.

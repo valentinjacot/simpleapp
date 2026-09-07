@@ -41,6 +41,8 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   `opentelemetry-exporter-otlp-proto-http` sends real traces+metrics to the
   Collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (compose only — console
   export still used for native dev)
+- `k8s/` manifests (app + Postgres only — scoped, not the observability stack)
+  tested against a local `kind` cluster
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
@@ -252,3 +254,28 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   prerequisite: Elasticsearch requires `vm.max_map_count >= 262144` — the user raised
   it via `sudo sysctl -w vm.max_map_count=262144` in their own terminal (same
   `sudo`/no-TTY pattern as the Phase 3 Postgres install).
+- **Phase 6, Step D (done 2026-09-07)**: Kubernetes manifests (`k8s/`), deliberately
+  scoped to app + Postgres — not Elasticsearch/Kibana/Collector, already proven via
+  compose in Step C; this step is about the deploy pattern itself. Tested against a
+  real local `kind` cluster (installed to `~/.local/bin`, no `sudo`), not just
+  written — checked the machine could actually handle it first (15GB RAM/20 cores,
+  ~6GB available; a single-node `kind` cluster idles around 400MB, lighter than the
+  full compose stack). Two Secrets, not one (`postgres-credentials`,
+  `simpleapp-secrets`) — least privilege, so the Postgres container never sees
+  `APP_PASSWORD_HASH`. `db`'s Deployment uses `strategy: Recreate`, not the default
+  `RollingUpdate` — two Postgres pods can't share one `ReadWriteOnce` PVC.
+  `imagePullPolicy: Never` + `kind load docker-image` is explicitly a
+  local-testing-only mechanism (a real cluster needs a real image registry).
+  **The real payoff of this step**: scaling `db` to 0 replicas and back proved the
+  liveness/readiness distinction end-to-end, for real — the readiness probe (`/readyz`)
+  failed (503), the pod was pulled from the `app` Service's endpoints, and the
+  liveness probe (`/healthz`, no DB check) kept passing, so Kubernetes correctly did
+  **not** restart the pod (`RESTARTS` stayed `0` throughout). Phase 5 could only
+  simulate this with a second throwaway uvicorn process; this is the actual mechanism
+  the two endpoints were built for. Also confirmed the PVC persisted data across the
+  Postgres pod being deleted and recreated during that test. **Real k8s vs. compose
+  gap, worth knowing**: there's no manifest-level equivalent of compose's
+  `depends_on: condition: service_completed_successfully` — verification here
+  sequenced `kubectl apply`/`kubectl wait` by hand (postgres → migrate Job → app); a
+  real deployment would use a Helm hook, an Argo CD sync wave, or CI-pipeline step
+  ordering instead.

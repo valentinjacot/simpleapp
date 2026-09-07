@@ -405,3 +405,50 @@ Findings:
   (traces + metrics).
 - Cleaned up with `docker compose down -v` after testing so the Postgres and
   Elasticsearch volumes are empty again for the first real run.
+
+## Phase 6, Step D results (Kubernetes manifests, last run: 2026-09-07)
+
+Scoped to app + Postgres only (not Elasticsearch/Kibana/Collector — already proven
+via compose in Step C; this step is about the deploy pattern, not re-proving
+observability infra in a second environment). Tested against a real, local
+single-node cluster (`kind`, installed to `~/.local/bin`, no `sudo` needed), not just
+written and eyeballed — same standard as every other phase. Host prerequisite
+confirmed first: 15GB RAM / 20 CPU cores, ~6GB available, lighter than the full
+compose stack already run in Step C.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `kind create cluster` | single node reaches `Ready` | ready in ~30s, ~400MB at idle |
+| 2 | `kind load docker-image` + `kubectl apply -f k8s/postgres.yaml` | `db` pod reaches `Ready` (PVC dynamically provisioned) | ready |
+| 3 | `kubectl apply -f k8s/migrate-job.yaml` | Job completes, log shows the same `alembic upgrade head` output as native/compose | `Completed`, correct log |
+| 4 | `kubectl apply -f k8s/app.yaml` | `app` pod reaches `1/1 Ready` (readiness probe = `/readyz`, which needs the DB — so `Ready` already proves DB reachability) | ready |
+| 5 | `kubectl port-forward svc/app 8080:8000`, then the standard login/entries flow | 200 / `{"ok":true}` / `[]` / 201 | all as expected, fresh DB |
+| 6 | `kubectl scale deployment/db --replicas=0` (simulate DB outage) | `app` pod: readiness probe fails (503 from `/readyz`), pod pulled from Service endpoints; liveness probe (`/healthz`, no DB check) keeps passing, so **no restart** | confirmed: `Unhealthy` readiness event, endpoint removed, `RESTARTS: 0` throughout |
+| 7 | `kubectl scale deployment/db --replicas=1` (restore) | `app` pod returns to `Ready`, back in Service endpoints, still `RESTARTS: 0` | confirmed |
+| 8 | Data check after the `db` pod was deleted and recreated (step 6→7) | the entry created in step 5 is still there (PVC persistence) | confirmed present |
+
+Findings:
+- **This is the real-cluster proof of the liveness/readiness distinction** that
+  Phase 5 could only simulate (a second throwaway uvicorn process pointed at a bad
+  port). Here, an actual Kubernetes readiness probe failure actually removes the pod
+  from a real Service's load-balancing rotation, and an actual liveness probe
+  correctly does *not* restart a pod that's merely unready — the exact behavior the
+  two separate endpoints were built for in Phase 5, now demonstrated end-to-end.
+- **Real k8s vs. compose difference, worth knowing**: compose's `depends_on:
+  condition: service_completed_successfully` (used for `migrate` in Step B) has no
+  direct equivalent in plain Kubernetes manifests — there's no manifest-level "wait
+  for this Job before creating that Deployment." Verification here sequenced it by
+  hand (`kubectl apply` postgres → `kubectl wait` → `kubectl apply` migrate-job →
+  `kubectl wait` → `kubectl apply` app) — a real deployment would handle this with a
+  Helm pre-install hook, an Argo CD sync wave, or an equivalent CI-pipeline step
+  ordering, not a manifest alone.
+- Split credentials into two Secrets (`postgres-credentials`, `simpleapp-secrets`)
+  rather than one shared Secret — least privilege: the Postgres container has no
+  reason to ever see `APP_PASSWORD_HASH`.
+- `imagePullPolicy: Never` + `kind load docker-image` is a **local-testing-only**
+  mechanism — a real cluster needs a real image registry (ECR/GCR/Docker Hub/etc.)
+  and `IfNotPresent`/`Always`. Noted explicitly, not left implicit.
+- Deployment's `strategy: type: Recreate` for `db` (not the default `RollingUpdate`)
+  — two Postgres pods can't share one `ReadWriteOnce` PVC; `RollingUpdate`'s
+  overlap-old-and-new-pod behavior would deadlock waiting for a second PVC mount.
+- Cleaned up with `kind delete cluster` after testing.

@@ -17,7 +17,7 @@ with the virtualenv already created at `.venv/`.
 
 # Postgres 14 must already be running natively with the simpleapp role/db created.
 # See CLAUDE.md's Phase 3 notes if that's not done yet. (This is the native dev setup —
-# see §11 for the Docker Compose alternative, which brings its own separate Postgres.)
+# see §9 for the Docker Compose alternative, which brings its own separate Postgres.)
 
 cp .env.example .env
 # Fill in .env:
@@ -53,7 +53,8 @@ running — find and kill it first: `pgrep -fa "uvicorn app:app"` then `kill <pi
 
 ## 3. First checks: is it alive?
 
-Two separate probes, on purpose (see §9 for why):
+Two separate probes, on purpose (see §11 for why, and §10 to see it matter for real
+under Kubernetes):
 
 ```bash
 curl -i http://127.0.0.1:8000/healthz   # liveness — "is the process up at all"
@@ -300,7 +301,98 @@ docker compose down -v    # also deletes both volumes — genuinely fresh next t
 
 ---
 
-## 10. Why it's built this way — choices, trade-offs, alternatives
+## 10. Running on Kubernetes (kind)
+
+`k8s/` holds manifests for app + Postgres, scoped deliberately — Elasticsearch/
+Kibana/Collector stay on compose (§9); this is about the deploy pattern, not
+re-running the observability stack in a second place. This section uses `kind`
+(Kubernetes-in-Docker) to test against a real local cluster. Not installed by
+default — install once:
+
+```bash
+curl -sLo kubectl "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl && mv kubectl ~/.local/bin/kubectl
+curl -sLo kind "https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64"
+chmod +x kind && mv kind ~/.local/bin/kind
+```
+
+Create the cluster and load the app image into it (`kind` clusters don't see the
+host's Docker images automatically — `imagePullPolicy: Never` in the manifests
+expects this explicit load, since there's no registry for local testing):
+
+```bash
+kind create cluster --name simpleapp
+docker build -t simpleapp:k8s-test .
+kind load docker-image simpleapp:k8s-test --name simpleapp
+```
+
+Namespace and Secrets first (see `k8s/secret.example.yaml` for the shape — same
+"commit the shape, never the values" pattern as `.env.example`; reuses the same test
+credentials as elsewhere in this Runbook):
+
+```bash
+kubectl apply -f k8s/namespace.yaml
+kubectl create secret generic postgres-credentials -n simpleapp \
+  --from-literal=POSTGRES_USER=simpleapp \
+  --from-literal=POSTGRES_PASSWORD=simpleapp_dev \
+  --from-literal=POSTGRES_DB=simpleapp
+kubectl create secret generic simpleapp-secrets -n simpleapp \
+  --from-literal=DATABASE_URL="postgresql+psycopg2://simpleapp:simpleapp_dev@db/simpleapp" \
+  --from-literal=SESSION_SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  --from-literal=APP_USERNAME=testuser \
+  --from-literal=APP_PASSWORD_HASH="<.venv/bin/python scripts/hash_password.py output>"
+```
+
+Then Postgres, the migration Job, and the app — **in that order, waiting between
+each** (plain Kubernetes manifests have no equivalent of compose's `depends_on:
+condition: service_completed_successfully`; see `CLAUDE.md`'s Step D note):
+
+```bash
+kubectl apply -f k8s/postgres.yaml
+kubectl wait --for=condition=Ready pod -l app=db -n simpleapp --timeout=90s
+
+kubectl apply -f k8s/migrate-job.yaml
+kubectl wait --for=condition=Complete job/migrate -n simpleapp --timeout=60s
+kubectl logs job/migrate -n simpleapp   # should show "Running upgrade -> ..."
+
+kubectl apply -f k8s/app.yaml
+kubectl wait --for=condition=Ready pod -l app=simpleapp -n simpleapp --timeout=60s
+```
+
+Reach it (no Ingress/LoadBalancer set up — that's Phase 7 territory):
+
+```bash
+kubectl port-forward -n simpleapp svc/app 8080:8000
+```
+
+Everything in §3, §4, and §7 works the same against `http://127.0.0.1:8080`.
+`kubectl get pods -n simpleapp` and `kubectl logs -n simpleapp <pod>` are the
+`docker compose ps`/`logs` equivalents.
+
+**See the liveness/readiness split actually do its job** (this is what those two
+separate endpoints, from Phase 5, are for):
+
+```bash
+kubectl scale deployment/db -n simpleapp --replicas=0    # simulate a DB outage
+sleep 20
+kubectl get pods -n simpleapp                # app: 0/1 Ready, RESTARTS still 0
+kubectl get endpoints app -n simpleapp       # empty — pulled from the Service
+kubectl get events -n simpleapp | grep Unhealthy   # "Readiness probe failed... 503"
+
+kubectl scale deployment/db -n simpleapp --replicas=1    # restore
+kubectl wait --for=condition=Ready pod -l app=db -n simpleapp --timeout=60s
+# app returns to 1/1 Ready and back in the Service — still RESTARTS: 0 the whole time
+```
+
+Tear down:
+
+```bash
+kind delete cluster --name simpleapp
+```
+
+---
+
+## 11. Why it's built this way — choices, trade-offs, alternatives
 
 Plain-English summary. This is a **learning project** (see `CLAUDE.md`'s Purpose) —
 several choices below deliberately favor "see how the real thing works" over "fastest
@@ -321,15 +413,20 @@ way to ship," which is called out explicitly where relevant.
 | **Native install first, Docker later** (Postgres native in Phase 3, containerized in Phase 6) | Deliberate ordering on the roadmap — understand what's *inside* the container (a real `systemd`-managed Postgres, manual role/db creation) before automating it away | Both are now visible side by side: `docker compose up` is one command vs. several `sudo` steps for the native install | The two Postgres instances are genuinely separate databases with separate data (§9) — a source of "why don't I see my entries" confusion if forgotten |
 | **Elastic export deferred from Phase 5 to Phase 6** | Running Elasticsearch (+Kibana +Collector) natively would've been heavy (~2GB+ RAM, several `sudo` steps) for something that became near-free as Compose services one phase later | Avoided doing real infrastructure work twice (once native, then redone in containers) — done once, done as Compose services (§9) | Traces + metrics now land in Elasticsearch when running via compose (§9); structured logs still don't (see the next row) — native dev is still console-only for all three, by design |
 | **Structured logs not (yet) shipped to Elasticsearch** | Phase 6 Step C scoped to what `otel_setup.py` already owned — traces + metrics — not logs, to keep that step reviewable | No scope creep into a different subsystem (`logging_config.py`) for one step | Real gap, not closed: getting logs into Elasticsearch too needs a separate mechanism (an OTel Python logging bridge, or a Collector `filelog` receiver on stdout) — not built yet |
+| **k8s manifests scoped to app + Postgres only** (Phase 6 Step D) | Elasticsearch/Kibana/Collector already proven via compose (§9) — re-deploying the whole observability stack a second time in `kind` would prove the same thing twice | Kept the `kind` cluster light (~400MB idle) and the step focused on the actual new thing: the deploy pattern itself (Secrets, probes, a migration Job) | A real k8s deployment of this app would need the full stack — this only proves the app+DB half of it works on Kubernetes |
+| **`kind` (Kubernetes-in-Docker) for testing, not a cloud cluster** | Free, local, fast to create/destroy (~30s), no cloud account or cost | Same verify-don't-just-write discipline as every other phase, with zero external dependency | `imagePullPolicy: Never` + `kind load docker-image` only works because there's no registry involved — a real cluster needs a real one (ECR/GCR/Docker Hub), which changes the image-distribution step non-trivially |
 
 ### Known gaps, deferred on purpose (not forgotten)
 
 - No rate limiting / brute-force protection on `/login` — Phase 7.
-- No HTTPS/TLS — needs a reverse proxy, Phase 6/7.
+- No HTTPS/TLS — needs a reverse proxy, Phase 6/7 (no Ingress/LoadBalancer set up
+  for the k8s manifests either — `kubectl port-forward` only, for now).
 - No dependency vulnerability scanning.
 - No true SQL `NULL` tested anywhere — `notes` is non-NULL at both ORM and DB level;
   every other field is required. No optional-field design exists yet.
 - Structured logs aren't shipped to Elasticsearch (traces/metrics are, as of Phase 6
   Step C) — still console/stdout-only.
-- k8s manifests, CI pipeline — later Phase 6 steps.
+- k8s manifests don't include Elasticsearch/Kibana/Collector (Phase 6 Step D scope
+  — see the trade-offs row above).
+- CI pipeline — later Phase 6 step.
 - Graceful shutdown beyond OTel flush, 12-factor config review, load testing — Phase 7.

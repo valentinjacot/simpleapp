@@ -452,3 +452,44 @@ Findings:
   — two Postgres pods can't share one `ReadWriteOnce` PVC; `RollingUpdate`'s
   overlap-old-and-new-pod behavior would deadlock waiting for a second PVC mount.
 - Cleaned up with `kind delete cluster` after testing.
+
+## Phase 6, Step C follow-up: structured logs to Elasticsearch (last run: 2026-09-07)
+
+Closes the "logs deliberately out of scope" gap noted in Step C. New OTel logging
+bridge in `logging_config.py` (`LoggerProvider` + `BatchLogRecordProcessor` +
+`OTLPLogExporter`, all from packages already installed — no new dependency) ships
+every log record to the Collector via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
+alongside the existing stdout JSON handler (unchanged for native dev). Collector gets
+a third pipeline (`logs:`) exporting to a new `simpleapp-logs` index.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | App startup with OTLP logs enabled | stdout JSON logging unchanged; no errors | unchanged, confirmed |
+| 2 | `simpleapp-logs` index after traffic | real documents land | confirmed, `Body`/`SeverityText`/`Resource.service.name` present |
+| 3 | A log line logged during an active request (`request` event) | `TraceId`/`SpanId` on the ES document match the actual span from that request | confirmed — compared values directly, exact match |
+
+Findings:
+- **Real bug found and reverted, not shipped**: tried `mapping: mode: otel` on the
+  Collector's `elasticsearch` exporter (the setting Elastic's native APM UI needs) —
+  it broke metrics entirely: `document_parsing_exception: Can't find dynamic
+  template for dynamic template name [histogram]/[gauge_long]`, silently dropping
+  every histogram metric. Confirmed via `validate --config=...` that the field itself
+  is valid config (not a typo) — this is a genuine incompatibility between
+  `elasticsearchexporter` 0.113.0 and Elasticsearch 8.15.3, not a mistake on our
+  side. Reverted to the known-working explicit `traces_index`/`metrics_index`/
+  `logs_index` config immediately; did not leave the stack in the broken state.
+  Deleted the incorrectly-created `.ds-metrics-generic.otel-default-*` data stream
+  during cleanup (via the `_data_stream` API — a data stream's write index can't be
+  deleted directly as a plain index).
+- This finding is *why* Kibana's native APM UI isn't wired up here — see the next
+  entry for the real fix (a dedicated APM Server, not the generic `elasticsearch`
+  exporter's experimental OTel mapping mode).
+- Two independent trace-context mechanisms coexist harmlessly on the same log
+  record: the OTel `LoggingHandler` natively populates the log record's own
+  `trace_id`/`span_id` (top-level `TraceId`/`SpanId` fields in ES), while the
+  existing `TraceContextFilter` (built for the stdout JSON path) also stamps
+  `record.trace_id`/`record.span_id` as plain attributes — since Python's `logging`
+  shares one `LogRecord` object across all handlers on a logger, the filter (only
+  attached to the stdout handler) still mutates the record before the OTel handler
+  reads it. Both show the same values; the duplication is harmless, not worth
+  removing for the sake of it.

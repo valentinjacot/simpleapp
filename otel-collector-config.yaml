@@ -12,6 +12,7 @@ exporters:
     endpoints: ["http://elasticsearch:9200"]
     traces_index: simpleapp-traces
     metrics_index: simpleapp-metrics
+    logs_index: simpleapp-logs
   debug:
     verbosity: basic
 
@@ -22,6 +23,10 @@ service:
       processors: [batch]
       exporters: [elasticsearch, debug]
     metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [elasticsearch, debug]
+    logs:
       receivers: [otlp]
       processors: [batch]
       exporters: [elasticsearch, debug]

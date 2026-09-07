@@ -11,7 +11,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 import db
 from auth import require_login, verify_password
-from logging_config import configure_logging
+from logging_config import configure_logging, shutdown_logging
 from models import EntryCreate, EntryOut, LoginRequest
 from otel_setup import configure_telemetry, instrument_app, instrument_engine, shutdown_telemetry
 
@@ -29,6 +29,7 @@ SESSION_SECRET_KEY = os.environ["SESSION_SECRET_KEY"]
 async def lifespan(app: FastAPI):
     yield
     shutdown_telemetry()
+    shutdown_logging()
 
 
 app = FastAPI(lifespan=lifespan)

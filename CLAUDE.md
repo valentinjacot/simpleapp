@@ -279,3 +279,18 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   sequenced `kubectl apply`/`kubectl wait` by hand (postgres → migrate Job → app); a
   real deployment would use a Helm hook, an Argo CD sync wave, or CI-pipeline step
   ordering instead.
+- **Phase 6, Step C follow-up (done 2026-09-07)**: structured logs to Elasticsearch,
+  closing the gap Step C deliberately left open. `logging_config.py` gained an OTel
+  logging bridge (`LoggerProvider`/`BatchLogRecordProcessor`/`OTLPLogExporter` — all
+  from already-installed packages, no new dependency) that ships every log record to
+  the Collector via OTLP whenever `OTEL_EXPORTER_OTLP_ENDPOINT` is set, as a second
+  handler alongside the existing stdout JSON one (native dev unaffected). New
+  `simpleapp-logs` index; confirmed real trace correlation by comparing a request
+  log's `TraceId`/`SpanId` in Elasticsearch against its actual span. **Real bug
+  found while investigating Elastic's native APM UI**: `mapping: mode: otel` on the
+  Collector's `elasticsearch` exporter — the setting that data needs to be in for
+  Kibana's APM app to recognize it — broke metrics entirely
+  (`document_parsing_exception`, missing dynamic templates for histogram/gauge
+  types), a real incompatibility between `elasticsearchexporter` 0.113.0 and
+  Elasticsearch 8.15.3. Reverted immediately rather than shipping it broken; this is
+  why the next step reaches for a dedicated APM Server instead of that mapping mode.

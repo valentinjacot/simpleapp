@@ -589,3 +589,43 @@ Findings:
   direct copy-paste of Tempo's ID into an Elasticsearch query silently returns zero
   hits, looking like the data's missing when it's actually a padding mismatch.
   Fixed by zero-padding (`.zfill(32)`) before using the ID anywhere else.
+
+## Grafana dashboard: simpleapp Overview (last run: 2026-09-07)
+
+Added a provisioned dashboard (`grafana/provisioning/dashboards/`) with 8 panels
+covering metrics (4 stats + 2 timeseries), logs (1), and traces (1). Verified each
+panel's actual query — not just that the dashboard loaded — via Grafana's own
+`/api/ds/query` endpoint, the same API the dashboard frontend uses to fetch data.
+
+| # | Panel | Type | Verified via |
+|---|-------|------|--------------|
+| 1 | Request rate | stat (Prometheus) | `/api/ds/query` — real data returned |
+| 2 | P95 latency | stat (Prometheus) | `/api/ds/query` — real data returned |
+| 3 | Error rate (5xx) | stat (Prometheus) | `/api/ds/query` — real data returned |
+| 4 | Active requests | stat (Prometheus) | `/api/ds/query` — real data returned |
+| 5 | Request rate by route | timeseries (Prometheus) | `/api/ds/query` — real data returned |
+| 6 | P95 latency by route | timeseries (Prometheus) | `/api/ds/query` — real data returned |
+| 7 | Recent traces | traces (Tempo, TraceQL) | **not verifiable this way** — see finding |
+| 8 | Recent logs | logs (Loki) | `/api/ds/query` — 100 rows returned |
+
+Findings:
+- **Real, confirmed Grafana limitation, not a mistake in the panel JSON**: Tempo's
+  TraceQL query type is not supported through the generic `/api/ds/query` endpoint —
+  confirmed via a public, tracked Grafana issue
+  ([grafana/grafana#95042](https://github.com/grafana/grafana/issues/95042), "Tempo
+  API: add support for queryType `traceql` on `/api/ds/query`"). Ruled out a JSON
+  mistake on our side by sending a deliberately bogus `queryType` to the *Prometheus*
+  datasource on the same endpoint — Prometheus's backend ignores an unrecognized
+  `queryType` and runs the query anyway, while Tempo's backend strictly rejects
+  anything outside its allowlist, confirming the failure is Tempo-plugin-specific,
+  not a request-shape problem. The panel's JSON (`queryType: "traceql"`, a plain
+  TraceQL query string) matches Grafana's own documented shape.
+- **Consequence, stated plainly**: 7 of 8 panels were verified with the same rigor
+  as everything else in this project (real query execution, real data, not just "the
+  dashboard loaded"). The traces panel could not be verified the same way with the
+  tools available in this session — no browser automation to drive the actual
+  dashboard UI, which likely uses a different code path than `/api/ds/query` for
+  this datasource. Worth a manual check in the browser before trusting it fully.
+- Panel queries reference the `exported_job="simpleapp"` label (not `job`), matching
+  the label-renaming behavior discovered in the earlier backend fan-out exercise —
+  built against the actual live label set, not assumed.

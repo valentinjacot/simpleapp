@@ -38,9 +38,10 @@ Optimize for MY understanding, not for shipping fast or being impressive.
 - `docker-compose.yml`: app + Postgres 14 + a one-off `migrate` service
   (`alembic upgrade head`, `depends_on: service_completed_successfully`) +
   Elasticsearch + Kibana + Elastic APM Server + a Grafana stack (Tempo/Loki/
-  Prometheus/Grafana) + an OTel Collector (`otel-collector-config.yaml`) fanning
-  the same traces/metrics/logs out to both backend sets — backend choice is a
-  Collector-config concern, no application code involved;
+  Prometheus/Grafana, with a provisioned "simpleapp Overview" dashboard) + an
+  OTel Collector (`otel-collector-config.yaml`) fanning the same traces/metrics/
+  logs out to both backend sets — backend choice is a Collector-config concern,
+  no application code involved;
   `opentelemetry-exporter-otlp-proto-http` sends real traces+metrics+logs to the
   Collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (compose only — console/
   stdout still used for native dev)
@@ -357,3 +358,19 @@ Optimize for MY understanding, not for shipping fast or being impressive.
     scrape-target `job`/`instance` labels take priority, the OTel-derived ones get
     renamed to `exported_job`/`exported_instance` to avoid colliding, confirmed by
     inspecting an actual query result.
+- **Grafana dashboard (done 2026-09-07)**: a provisioned "simpleapp Overview"
+  dashboard (`grafana/provisioning/dashboards/`) — 4 stat panels + 2 timeseries
+  panels (Prometheus: request rate, p95 latency, error rate, active requests, both
+  overall and broken down by route), 1 logs panel (Loki), 1 traces panel (Tempo,
+  TraceQL). 7 of 8 panels verified by executing their actual queries through
+  Grafana's own `/api/ds/query` endpoint — real data confirmed, not just "the
+  dashboard loaded." The 8th (traces) hit a genuine, publicly tracked Grafana
+  limitation: TraceQL isn't supported through that generic query endpoint
+  ([grafana/grafana#95042](https://github.com/grafana/grafana/issues/95042)).
+  Confirmed this is a Tempo-plugin-specific gap, not a mistake in the panel JSON, by
+  sending a bogus `queryType` to the Prometheus datasource on the same endpoint —
+  Prometheus ignores it and runs the query anyway; Tempo strictly rejects anything
+  outside its allowlist. The panel's JSON matches Grafana's own documented TraceQL
+  panel shape; flagged as unverified-by-automation rather than asserted as working,
+  since there's no browser-automation tool available in this session to drive the
+  actual dashboard UI (which likely uses a different code path for this datasource).

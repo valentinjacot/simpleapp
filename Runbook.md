@@ -431,7 +431,16 @@ backend exists; adding a backend is purely a Collector-exporter-config change.
 Already part of `docker compose up` in §9 — nothing extra to start.
 
 **Grafana**: open **http://127.0.0.1:3000** (no login — anonymous admin access for
-local dev, same posture as the rest of this stack). Explore → pick a datasource:
+local dev, same posture as the rest of this stack). A provisioned **"simpleapp
+Overview"** dashboard is already there (Dashboards → simpleapp Overview) — request
+rate, p95 latency, error rate, and active requests (overall and by route), plus a
+logs panel and a traces panel. 7 of its 8 panels were verified by executing their
+real queries through Grafana's own API before this dashboard was committed; the
+traces panel hit a genuine, tracked Grafana limitation
+([grafana/grafana#95042](https://github.com/grafana/grafana/issues/95042) — TraceQL
+isn't queryable through that generic endpoint) that made it unverifiable the same
+way — worth a quick manual look the first time you open it. Or explore ad hoc,
+pick a datasource:
 
 - **Tempo**: search by service name, click a trace for the same waterfall view
   you'd see in Kibana APM, sourced from the same span data.

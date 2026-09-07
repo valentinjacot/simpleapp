@@ -1,0 +1,129 @@
+{
+  "uid": "simpleapp-overview",
+  "title": "simpleapp Overview",
+  "tags": ["simpleapp"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Request rate",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_duration_milliseconds_count{exported_job=\"simpleapp\"}[5m]))",
+          "legendFormat": "req/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "P95 latency",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_server_duration_milliseconds_bucket{exported_job=\"simpleapp\"}[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Error rate (5xx)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_duration_milliseconds_count{exported_job=\"simpleapp\", http_status_code=~\"5..\"}[5m]))",
+          "legendFormat": "errors/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Active requests",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(http_server_active_requests{exported_job=\"simpleapp\"})",
+          "legendFormat": "active",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request rate by route",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_duration_milliseconds_count{exported_job=\"simpleapp\"}[5m])) by (http_target)",
+          "legendFormat": "{{http_target}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "P95 latency by route",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_server_duration_milliseconds_bucket{exported_job=\"simpleapp\"}[5m])) by (le, http_target))",
+          "legendFormat": "{{http_target}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "traces",
+      "title": "Recent traces",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"simpleapp\"}",
+          "limit": 20,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "logs",
+      "title": "Recent logs",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "expr": "{service_name=\"simpleapp\"}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

@@ -53,7 +53,7 @@ running — find and kill it first: `pgrep -fa "uvicorn app:app"` then `kill <pi
 
 ## 3. First checks: is it alive?
 
-Two separate probes, on purpose (see §13 for why, and §12 to see it matter for real
+Two separate probes, on purpose (see §14 for why, and §13 to see it matter for real
 under Kubernetes):
 
 ```bash
@@ -485,7 +485,96 @@ curl -s -G "http://127.0.0.1:9090/api/v1/query" --data-urlencode 'query=target_i
 
 ---
 
-## 12. Running on Kubernetes (kind)
+## 12. Side-by-side: the same request in Elastic and Grafana, at once
+
+§10 and §11 are separate tours — this is the fast, comparative version: one
+request, looked up by the exact same identifier in both stacks, back to back,
+so the "same telemetry, two backends" claim is something you check yourself
+rather than take on faith.
+
+### Step 1 — one request, one trace ID
+
+```bash
+COOKIES=$(mktemp)
+curl -s -c "$COOKIES" -X POST http://127.0.0.1:8000/login \
+  -H "Content-Type: application/json" -d '{"username":"testuser","password":"password1234"}' -o /dev/null
+curl -s -b "$COOKIES" http://127.0.0.1:8000/api/entries -o /dev/null
+rm -f "$COOKIES"
+
+# Grab the exact trace_id the app itself logged for that request
+docker compose logs --no-log-prefix --tail 5 app | grep '"path": "/api/entries"' | tail -1
+```
+
+Copy the `trace_id` value from the output — every step below reuses it.
+
+### Step 2 — the trace, same ID, both backends
+
+```bash
+TRACE_ID="<paste it here>"
+
+# Elastic — or Kibana: APM → Services → simpleapp → Transactions → GET /api/entries
+curl -s "http://127.0.0.1:9200/.ds-traces-apm-default-*/_search?pretty" \
+  -H "Content-Type: application/json" -d "{\"query\": {\"term\": {\"trace.id\": \"$TRACE_ID\"}}}"
+
+# Grafana Tempo — or Grafana: Explore → Tempo → paste the Trace ID directly
+curl -s "http://127.0.0.1:3200/api/traces/$TRACE_ID"
+```
+
+Both return the same spans (same names, same nesting — request span, then the
+`SELECT simpleapp` DB span inside it) from two backends that have never
+exchanged a byte with each other. **Use trace-ID lookup, not Tempo's tag search**
+(`/api/search?tags=...`, from §11) for a just-made trace — search has an
+ingestion delay before a trace is indexed by attribute; direct ID lookup is
+immediate, confirmed by comparing both right after generating traffic.
+
+### Step 3 — the log line, same trace_id, two different field shapes
+
+```bash
+# Elastic — ECS-style flat fields
+curl -s "http://127.0.0.1:9200/.ds-logs-apm.app.simpleapp-default-*/_search?pretty" \
+  -H "Content-Type: application/json" -d "{\"query\": {\"match\": {\"trace.id\": \"$TRACE_ID\"}}}"
+
+# Loki — trace_id is structured metadata, not a label (§11), so filter with
+# a LogQL line filter after the stream selector, not inside it
+curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
+  --data-urlencode "query={service_name=\"simpleapp\"} | trace_id=\"$TRACE_ID\""
+```
+
+Same underlying log record — check `duration_ms` in both results, it's
+identical — addressed completely differently: Elastic hands you a flat document
+keyed by a field; Loki makes you pick a label stream first, then filter within
+it by structured metadata.
+
+### Step 4 — metrics: same concept, genuinely different numbers (expected)
+
+Metrics aren't a per-request lookup the way traces/logs are — both backends
+report an *aggregate* over whatever traffic each has independently seen, over
+windows that don't line up. Don't expect these two numbers to match exactly:
+
+```bash
+# Elastic APM's own pre-computed rollup (average latency for this route)
+curl -s "http://127.0.0.1:5601/internal/apm/services/simpleapp/transactions/groups/main_statistics?start=2026-09-01T00:00:00.000Z&end=2026-09-08T00:00:00.000Z&environment=ENVIRONMENT_ALL&kuery=&transactionType=request&documentType=transactionMetric&rollupInterval=1m&useDurationSummary=true&latencyAggregationType=avg" \
+  -H "kbn-xsrf: true"
+
+# Prometheus — same concept, computed live via a PromQL query you write yourself
+curl -s -G "http://127.0.0.1:9090/api/v1/query" \
+  --data-urlencode 'query=sum(http_server_duration_milliseconds_sum{http_target="/api/entries"}) / sum(http_server_duration_milliseconds_count{http_target="/api/entries"})'
+```
+
+Both answer "how slow is `GET /api/entries`" from the same raw measurements the
+app emits — Elastic pre-computes the answer for you (APM Server's rollup, §10);
+Prometheus makes you ask for it (`sum(...) / sum(...)`). Different philosophy
+about where the aggregation work happens, same source data underneath.
+
+### The one-sentence version
+
+Same trace ID, same log line, same underlying measurement — landing in two
+backends that have never talked to each other, because the Collector duplicated
+one OTLP payload twice. That's the whole fan-out exercise, held in one hand.
+
+---
+
+## 13. Running on Kubernetes (kind)
 
 `k8s/` holds manifests for app + Postgres, scoped deliberately — Elasticsearch/
 Kibana/Collector stay on compose (§9); this is about the deploy pattern, not
@@ -576,7 +665,7 @@ kind delete cluster --name simpleapp
 
 ---
 
-## 13. Why it's built this way — choices, trade-offs, alternatives
+## 14. Why it's built this way — choices, trade-offs, alternatives
 
 Plain-English summary. This is a **learning project** (see `CLAUDE.md`'s Purpose) —
 several choices below deliberately favor "see how the real thing works" over "fastest

@@ -53,7 +53,7 @@ running — find and kill it first: `pgrep -fa "uvicorn app:app"` then `kill <pi
 
 ## 3. First checks: is it alive?
 
-Two separate probes, on purpose (see §11 for why, and §10 to see it matter for real
+Two separate probes, on purpose (see §12 for why, and §11 to see it matter for real
 under Kubernetes):
 
 ```bash
@@ -321,7 +321,107 @@ docker compose down -v    # also deletes both volumes — genuinely fresh next t
 
 ---
 
-## 10. Running on Kubernetes (kind)
+## 10. A guided tour: learning what Elastic Observability actually shows you
+
+This section is for understanding the *concepts*, not just running commands — a
+walkthrough of what each pillar (traces, metrics, logs) actually is, why a real APM
+backend changes what you can see, and — just as important — what's still missing
+from a genuinely production-grade setup. Do this with the compose stack up (§9).
+
+### Step 1 — generate some real variety
+
+One request tells you nothing interesting. Generate a mix, so there's something to
+actually look at:
+
+```bash
+COOKIES=$(mktemp)
+curl -s -c "$COOKIES" -X POST http://127.0.0.1:8000/login \
+  -H "Content-Type: application/json" -d '{"username":"testuser","password":"password1234"}' -o /dev/null
+curl -s -b "$COOKIES" http://127.0.0.1:8000/api/entries -o /dev/null
+curl -s -b "$COOKIES" -X POST http://127.0.0.1:8000/api/entries \
+  -H "Content-Type: application/json" -d '{"date":"2026-09-07","distance_km":5,"duration_min":25,"notes":"tour"}' -o /dev/null
+curl -s -b "$COOKIES" -X POST http://127.0.0.1:8000/api/entries \
+  -H "Content-Type: application/json" -d '{"date":"2026-09-07","distance_km":-5,"duration_min":25,"notes":"bad"}' -o /dev/null   # 422, on purpose
+rm -f "$COOKIES"
+```
+
+### Step 2 — traces: the raw event data
+
+Open **http://127.0.0.1:5601** → ☰ → Observability → APM → Services → `simpleapp` →
+Transactions tab. Click into `GET /api/entries`. What you're looking at: **one span
+per unit of work**, nested — a parent span for the whole HTTP request, a child span
+for the SQL query inside it. This is what "auto-instrumentation" bought you for
+free: nobody wrote `start_span()`/`end_span()` anywhere in `app.py` or `db.py` —
+`FastAPIInstrumentor` and `SQLAlchemyInstrumentor` (`otel_setup.py`) generate this
+automatically. A trace is the *ground truth* — everything else on this page is
+computed from traces like this one.
+
+### Step 3 — metrics: computed, not measured separately
+
+Look at the latency/throughput numbers on the Services list, or the per-transaction
+stats. **These are not a second, independently-collected data source** — APM
+Server computes them by aggregating the raw trace data from Step 2 (look at the
+`.ds-metrics-apm.service_transaction.1m-*` data stream directly if you want to see
+the rollup documents themselves). This is the actual value of a real APM backend
+over a generic index: it does this aggregation work for you, continuously, so
+"what's my p99 latency for this route" isn't a query you have to write by hand.
+
+### Step 4 — logs: correlated back to the trace
+
+Same service page → Logs tab. Find a `request` log line and note its trace — then
+compare it to the trace you looked at in Step 2. The correlation is real, not
+cosmetic: `logging_config.py`'s `TraceContextFilter` and the OTel `LoggingHandler`
+both read the *same* active span context at the moment the log line was written, so
+a log line and its trace share the exact same `trace_id`. This is what "the three
+pillars" actually means in practice: one identifier lets you pivot from "this
+request was slow" (trace) to "here's what it logged while running" (logs) without
+manually cross-referencing timestamps.
+
+### Step 5 — errors: what an *unhandled* exception looks like
+
+The Errors tab is empty so far — nothing has thrown an exception yet. Trigger a
+real one (temporarily break the DB connection mid-request, not a validation error
+— Pydantic 422s are normal responses, not exceptions):
+
+```bash
+docker compose stop db
+COOKIES=$(mktemp)
+curl -s -c "$COOKIES" -X POST http://127.0.0.1:8000/login \
+  -H "Content-Type: application/json" -d '{"username":"testuser","password":"password1234"}' -o /dev/null
+curl -s -b "$COOKIES" -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/api/entries   # 500
+rm -f "$COOKIES"
+docker compose start db
+```
+
+Refresh the Errors tab: a `sqlalchemy.exc.OperationalError` group appears, with the
+**full original exception message and the actual failing SQL statement** —
+`db.py`'s `get_all_entries()` has no `try`/`except` around the query, so the
+exception propagates all the way up through FastAPI, and the instrumentation
+captures it exactly as it happened. (It's flagged `"handled": true` — meaning
+FastAPI's own exception-handling middleware caught it and returned a clean `500`
+rather than crashing the process; "handled" here is about the process surviving,
+not about anyone in application code having written a `try`/`except`.)
+
+### What this tour does *not* show you — because it isn't there
+
+- **No Service Map** — needs an Elastic Platinum license; `403` on this free tier.
+- **No dashboards** — nothing's been built in Lens; you're reading the built-in APM
+  views, not a curated operational dashboard.
+- **No alerting** — nothing pages anyone if latency spikes or the error rate climbs.
+  Kibana's Alerting framework exists and could be wired to this data, but isn't.
+- **No retention policy** — data just accumulates on one Elasticsearch node; no
+  ILM, no backups.
+- **No security** — `xpack.security.enabled: false` everywhere; anyone who can
+  reach these ports has full access. Fine for local learning, not for anything real.
+
+That gap — from "I can go look at what happened" (everything above) to "the system
+tells someone when something's wrong" (none of the above) — is the actual
+difference between a working observability *setup* and a mature observability
+*practice*. Worth keeping in mind before assuming more of this exists than does.
+
+---
+
+## 11. Running on Kubernetes (kind)
 
 `k8s/` holds manifests for app + Postgres, scoped deliberately — Elasticsearch/
 Kibana/Collector stay on compose (§9); this is about the deploy pattern, not
@@ -412,7 +512,7 @@ kind delete cluster --name simpleapp
 
 ---
 
-## 11. Why it's built this way — choices, trade-offs, alternatives
+## 12. Why it's built this way — choices, trade-offs, alternatives
 
 Plain-English summary. This is a **learning project** (see `CLAUDE.md`'s Purpose) —
 several choices below deliberately favor "see how the real thing works" over "fastest

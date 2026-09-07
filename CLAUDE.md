@@ -35,6 +35,9 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   Phase 6, alongside Elasticsearch/Kibana/Collector as compose services)
 - `Dockerfile` (single-stage, non-root `appuser`, `python:3.13-slim`); no compiler
   needed since `psycopg2-binary` ships a prebuilt wheel
+- `docker-compose.yml`: app + Postgres 14 + a one-off `migrate` service
+  (`alembic upgrade head`, `depends_on: service_completed_successfully`) — real
+  Elasticsearch/Kibana/Collector services land in a later Phase 6 step
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
@@ -199,3 +202,24 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   native run. Deliberately not "fixed" here — Step B's compose setup puts the app and
   Postgres on the same Docker network, which sidesteps this whole class of problem
   rather than working around the host-networking gap.
+- **Phase 6, Step B (done 2026-09-07)**: `docker-compose.yml` — `db` (Postgres 14,
+  `pg_isready` healthcheck, named volume `pgdata` for persistence across restarts),
+  `migrate` (same app image, `command: alembic upgrade head`, runs once and exits),
+  `app` (waits for `db` healthy *and* `migrate` to exit 0 via
+  `condition: service_completed_successfully` — a standard init-container-style
+  pattern, migrations as an explicit separate step rather than folded into app
+  startup). Confirmed Step A's host-networking gap is resolved by design: `db` is a
+  resolvable hostname on the compose network, so `/readyz` and every DB-backed route
+  work immediately. Confirmed idempotency (`docker compose down` + `up` again: no
+  "Running upgrade" line the second time, already at `head`) and persistence (an
+  entry created before `down` was still present after `up`, via the named volume —
+  `down` alone doesn't remove volumes, only `down -v` does). `app`'s Docker
+  healthcheck uses a Python one-liner (`urllib.request.urlopen` against `/healthz`)
+  instead of `curl`, since `python:3.13-slim` doesn't include `curl` and stdlib
+  already covers it — no new package just for a healthcheck. Compose's automatic
+  `.env` loading supplies `SESSION_SECRET_KEY`/`APP_USERNAME`/`APP_PASSWORD_HASH`
+  (same file as native dev, already gitignored); `DATABASE_URL` is set explicitly in
+  `docker-compose.yml` itself (pointing at `db`, not `localhost`), not read from
+  `.env`, since the native and compose databases are deliberately different
+  targets. Compose's own Postgres is **not** published to the host — only `app`'s
+  port 8000 is — so it can't collide with the native Postgres on 5432.

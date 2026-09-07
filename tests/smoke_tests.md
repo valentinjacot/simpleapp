@@ -321,3 +321,39 @@ Findings:
   warning — expected and harmless in a container build (each container is an
   isolated, disposable filesystem; there's no host system package manager to
   conflict with), not a real issue.
+
+## Phase 6, Step B results (docker-compose, last run: 2026-09-07)
+
+`docker compose up -d --build`, then re-ran a subset of the standard auth/entries
+suite against `http://127.0.0.1:8000` (now backed by the compose Postgres, not
+native). Also tested restart behavior (`docker compose down` + `up` again) to check
+migration idempotency and data persistence via the named volume.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `db` service startup | reports `(healthy)` via `pg_isready` | healthy |
+| 2 | `migrate` service, first run (empty DB) | exits 0, log shows `Running upgrade -> ... create entries table` | exit 0, ran |
+| 3 | `app` service | starts only after `migrate` exits successfully; reports `(healthy)` via its own `/healthz` healthcheck | started, healthy |
+| 4 | `GET /readyz` | 200 — DB now reachable (Step A's gap fixed by design) | 200 |
+| 5 | `POST /login` → `GET /api/entries` → `POST /api/entries` | 200 / 200 (`[]` on fresh DB) / 201 | all as expected |
+| 6 | `docker compose down` + `docker compose up -d` (2nd run) | `migrate` exits 0 with **no** "Running upgrade" line (already at head); entry from step 5 still present | confirmed both |
+
+Findings:
+- Step A's finding is resolved by design, not patched: app and Postgres share the
+  compose network (`db` is a resolvable hostname), so there's no host-networking gap
+  to work around.
+- The `migrate` service (`command: ["alembic", "upgrade", "head"]`, same image as
+  `app`) plus `depends_on: migrate: condition: service_completed_successfully` is a
+  clean, standard init-container-style pattern — migrations run as an explicit,
+  separate step with their own exit code, never silently baked into app startup.
+- Confirmed genuinely idempotent: the second `migrate` run's log has no "Running
+  upgrade" line at all (Alembic checked `alembic_version`, found it already at
+  `head`, did nothing) — safe to run on every `docker compose up`.
+- Confirmed the named volume (`pgdata`) is what makes data survive `docker compose
+  down` + `up` — `down` alone removes containers/network but not volumes; `down -v`
+  would remove the volume too (not used here, to avoid accidentally wiping real data
+  once this is used for real).
+- App healthcheck uses a Python one-liner (`urllib.request.urlopen`) hitting
+  `/healthz`, not `curl` — the `python:3.13-slim` base image doesn't include `curl`,
+  and Python's stdlib already can do the job without adding a package just for a
+  healthcheck.

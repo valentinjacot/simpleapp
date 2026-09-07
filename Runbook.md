@@ -15,8 +15,9 @@ with the virtualenv already created at `.venv/`.
 ```bash
 .venv/bin/pip install -r requirements.txt
 
-# Postgres 14 must already be running natively (not Docker — that's Phase 6) with the
-# simpleapp role/db created. See CLAUDE.md's Phase 3 notes if that's not done yet.
+# Postgres 14 must already be running natively with the simpleapp role/db created.
+# See CLAUDE.md's Phase 3 notes if that's not done yet. (This is the native dev setup —
+# see §11 for the Docker Compose alternative, which brings its own separate Postgres.)
 
 cp .env.example .env
 # Fill in .env:
@@ -214,7 +215,51 @@ rm -f "$COOKIES"
 
 ---
 
-## 9. Why it's built this way — choices, trade-offs, alternatives
+## 9. Running via Docker Compose (alternative to §1–§2)
+
+`docker-compose.yml` runs the app and Postgres as containers on their own network —
+no native Postgres, no `.venv`, no `alembic upgrade head` by hand. This is a
+**separate, empty database** from the native one in §1 (see `CLAUDE.md`'s Phase 6
+Step B note) — entries created here won't show up in the native setup, or vice versa.
+
+```bash
+docker compose up -d --build
+```
+
+This builds the app image, starts Postgres, waits for it to report healthy, runs
+`alembic upgrade head` in a one-off `migrate` container, then starts the app — only
+once `migrate` exits successfully. Check it worked:
+
+```bash
+docker compose ps                    # both db and app should show "(healthy)"
+docker compose logs migrate          # should show "Running upgrade -> ... create
+                                      # entries table" on the very first run, and
+                                      # nothing on subsequent runs (already migrated)
+```
+
+Everything in §3, §4, §6, and §7 above works exactly the same against
+`http://127.0.0.1:8000` — the app doesn't know or care whether it's containerized.
+Only the logging/tracing commands in §5–§6 change slightly, since output goes to
+`docker compose logs` instead of a redirected file:
+
+```bash
+# --no-log-prefix: compose normally prefixes each line with "app-1  | ", which
+# breaks jq's JSON parsing — strip it to get back to plain JSON lines.
+docker compose logs --no-log-prefix -f app | jq .
+docker compose logs --no-log-prefix app | jq -c 'select(.message == "request")'
+```
+
+Stopping:
+
+```bash
+docker compose down       # stops and removes containers/network; DATA IS KEPT
+                           # (the pgdata volume survives)
+docker compose down -v    # also deletes the volume — genuinely fresh next time
+```
+
+---
+
+## 10. Why it's built this way — choices, trade-offs, alternatives
 
 Plain-English summary. This is a **learning project** (see `CLAUDE.md`'s Purpose) —
 several choices below deliberately favor "see how the real thing works" over "fastest
@@ -231,7 +276,7 @@ way to ship," which is called out explicitly where relevant.
 | **`SameSite=Lax` + `HttpOnly` cookie, security headers** (Phase 4) | Standard, low-effort CSRF/XSS/clickjacking mitigations that don't need a library | Meaningful protection for near-zero code | Not a substitute for rate limiting on `/login` (still absent, deferred to Phase 7) or HTTPS (deferred to Phase 6/7 — needs a reverse proxy) |
 | **Stdlib `logging` + custom JSON formatter** over a logging library | `extra={...}` already does everything needed; one less dependency | Full control, no library API to learn, easy to read (`logging_config.py` is ~45 lines) | A library like `structlog` would add contextvars-based automatic context propagation (e.g. request ID threaded through without passing it explicitly everywhere) |
 | **OTel auto-instrumentation + console exporters** (Phase 5, Step C) | Auto-instrumentation (`FastAPIInstrumentor`, `SQLAlchemyInstrumentor`) needs zero manual span code; console output needs no backend to stand up yet | See a real trace (request span → nested DB-query span) and real metrics locally, immediately, with no infrastructure | Console output isn't searchable, isn't retained, and isn't what you'd actually run — it's a deliberate stepping stone to real OTLP export (Phase 6) |
-| **Native installs, not Docker** (Postgres in Phase 3, deferred Elastic stack) | Docker is explicitly a later phase (6) on the roadmap — the point is to first understand what's *inside* the container before automating it away | Forces understanding of what a real install/service/`systemd` unit actually involves | More manual setup steps now (e.g. `sudo` role creation) that Compose will make closer to one command in Phase 6 |
+| **Native install first, Docker later** (Postgres native in Phase 3, containerized in Phase 6) | Deliberate ordering on the roadmap — understand what's *inside* the container (a real `systemd`-managed Postgres, manual role/db creation) before automating it away | Both are now visible side by side: `docker compose up` is one command vs. several `sudo` steps for the native install | The two Postgres instances are genuinely separate databases with separate data (§9) — a source of "why don't I see my entries" confusion if forgotten |
 | **Elastic export deferred to Phase 6** (not done in Phase 5) | Running Elasticsearch (+Kibana +Collector) natively is heavy (~2GB+ RAM, several `sudo` steps) for something that becomes near-free as Compose services next phase | Avoids doing real infrastructure work twice (once native, then redone in containers) | Phase 5's traces/metrics/logs are console-only until Phase 6 — not yet centrally searchable |
 
 ### Known gaps, deferred on purpose (not forgotten)

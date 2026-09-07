@@ -493,3 +493,41 @@ Findings:
   attached to the stdout handler) still mutates the record before the OTel handler
   reads it. Both show the same values; the duplication is harmless, not worth
   removing for the sake of it.
+
+## Phase 6, Step C follow-up: Elastic APM Server (last run: 2026-09-07)
+
+Real fix for the broken `mapping: mode: otel` finding above: added a dedicated
+`apm-server` service and re-pointed the Collector at it (`otlphttp/elastic`
+exporter → `http://apm-server:8200`) instead of the generic `elasticsearch`
+exporter. APM Server owns the OTel-to-Elastic-APM-data-model mapping itself —
+that's its actual job — sidestepping the exporter bug entirely rather than working
+around it.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `apm-server` startup | registers `/v1/traces`, `/v1/metrics`, `/v1/logs` HTTP handlers; "no longer blocking ingestion" (confirms ES+Kibana connectivity) | confirmed |
+| 2 | Traffic through `otlphttp/elastic` | no errors in Collector or APM Server logs | none, confirmed clean |
+| 3 | Old `simpleapp-traces`/`simpleapp-logs` indices | should stop growing — old exporter fully removed from config | confirmed flat (isolated with a before/after count around one request) |
+| 4 | New APM data streams | `.ds-traces-apm-default-*`, `.ds-logs-apm.app.simpleapp-*`, `.ds-metrics-apm.app.simpleapp-*`, plus APM Server's own **computed rollups** (`.ds-metrics-apm.service_summary.1m-*`, `.ds-metrics-apm.service_transaction.1m-*`, `.ds-metrics-apm.service_destination.1m-*`) | all present, all growing with real data |
+| 5 | Kibana APM "Services" API (`/internal/apm/services`) | recognizes `simpleapp` as a real service | `{"serviceName":"simpleapp","agentName":"opentelemetry/python","latency":38447,...}` |
+| 6 | Kibana APM per-transaction stats | real, distinct latency per route | `POST /login` ~75ms (scrypt hashing cost, as expected), `GET /healthz` ~2ms, `GET /api/entries` ~38ms — numbers make sense given what each route does |
+| 7 | Service Map | — | `403 Forbidden`: **requires an Elastic Platinum license** — not a bug, a licensing limit on the free tier |
+
+Findings:
+- APM Server auto-computes rollup metrics (service summary, per-transaction
+  latency/throughput, service-destination/dependency metrics) directly from the raw
+  trace data — this is the actual value of running a real APM Server instead of
+  just dumping spans into a generic index: Kibana's APM UI reads these rollups, not
+  raw spans, for its main views.
+- `apm-server.auth.anonymous.enabled=true` was necessary — without it, APM Server
+  requires a secret token/API key for intake, appropriate for production but
+  unnecessary friction for local learning (matches `xpack.security.enabled: false`
+  on Elasticsearch, the same "no auth for local dev" posture used throughout this
+  compose stack).
+- Confirmed cleanly deprecated the `elasticsearch` exporter path: verified via
+  direct before/after document counts (not just assumption) that `simpleapp-traces`
+  and `simpleapp-logs` stopped growing once `otel-collector-config.yaml` no longer
+  referenced them.
+- Service Map's Platinum-license gate is a genuine trade-off of self-hosting the
+  free/basic tier — a real production Elastic subscription (or Elastic Cloud) would
+  unlock it; noted, not worked around.

@@ -218,12 +218,12 @@ rm -f "$COOKIES"
 
 ## 9. Running via Docker Compose (alternative to §1–§2)
 
-`docker-compose.yml` runs the app, Postgres, Elasticsearch, Kibana, and an OTel
-Collector as containers on their own network — no native Postgres, no `.venv`, no
-`alembic upgrade head` by hand, and (unlike native dev) traces/metrics go to a real
-backend instead of the console. This is a **separate, empty database** from the
-native one in §1 (see `CLAUDE.md`'s Phase 6 Step B note) — entries created here
-won't show up in the native setup, or vice versa.
+`docker-compose.yml` runs the app, Postgres, Elasticsearch, Kibana, an Elastic APM
+Server, and an OTel Collector as containers on their own network — no native
+Postgres, no `.venv`, no `alembic upgrade head` by hand, and (unlike native dev)
+traces/metrics/logs go to a real backend instead of the console. This is a
+**separate, empty database** from the native one in §1 (see `CLAUDE.md`'s Phase 6
+Step B note) — entries created here won't show up in the native setup, or vice versa.
 
 **One-time host prerequisite** (Elasticsearch requires this; it isn't `sudo`-able
 from inside a container):
@@ -238,9 +238,10 @@ docker compose up -d --build
 ```
 
 This builds the app image, starts Postgres and Elasticsearch in parallel, waits for
-both to report healthy, runs `alembic upgrade head` in a one-off `migrate` container
-and starts the OTel Collector, then starts the app — only once `migrate` exits
-successfully. Check it worked:
+both to report healthy, brings up Kibana and APM Server (which waits on
+Elasticsearch), runs `alembic upgrade head` in a one-off `migrate` container and
+starts the OTel Collector (which waits on APM Server), then starts the app — only
+once `migrate` exits successfully. Check it worked:
 
 ```bash
 docker compose ps                    # db, elasticsearch, app should show "(healthy)"
@@ -249,6 +250,8 @@ docker compose logs migrate          # "Running upgrade -> ... create entries ta
 curl http://127.0.0.1:9200/_cluster/health?pretty   # "status": "green" or "yellow"
 curl http://127.0.0.1:5601/api/status               # Kibana; 200 once ready (can take
                                                       # a bit longer than the others)
+docker compose logs apm-server | grep "no longer blocking ingestion"   # confirms it
+                                                      # connected to ES + Kibana OK
 ```
 
 Everything in §3, §4, and §7 above works exactly the same against
@@ -263,38 +266,49 @@ docker compose logs --no-log-prefix -f app | jq .
 docker compose logs --no-log-prefix app | jq -c 'select(.message == "request")'
 ```
 
-**§5 and §6 both work completely differently here** — the app no longer prints logs
-or spans/metrics to its own stdout in the same way (`OTEL_EXPORTER_OTLP_ENDPOINT`
-switches both `logging_config.py` and `otel_setup.py` to real OTLP export; stdout
-JSON logging is still there too, as a second parallel output — only spans/metrics
-skip the console entirely). Read traces, metrics, and logs from Elasticsearch:
+**§5 and §6 both work completely differently here** — the app no longer prints
+spans/metrics to its own stdout at all (`OTEL_EXPORTER_OTLP_ENDPOINT` switches both
+`logging_config.py` and `otel_setup.py` to real OTLP export, through the Collector,
+through APM Server — stdout JSON logging is still there too, as a second parallel
+output; only spans/metrics skip the console entirely).
+
+**The main way to look at this is Kibana's APM app**, not raw Elasticsearch queries
+— that's the entire point of routing through a real APM Server instead of a generic
+index (see `CLAUDE.md`'s Step C follow-up note). Open **http://127.0.0.1:5601**,
+then ☰ menu → **Observability → APM → Services**. You should see `simpleapp` listed
+(agent: `opentelemetry/python`) with real latency/throughput/error-rate numbers.
+Click into it for per-route latency (`Transactions` tab) and individual trace
+waterfalls. **Service Map is not available** on this free/basic license — that tab
+will 403; everything else works.
 
 ```bash
-# Traces — the Collector sends these to a named index
-curl -s "http://127.0.0.1:9200/simpleapp-traces/_search?size=5&pretty"
+# Same data, from the terminal — useful for scripting/verification, not routine use
+curl -s "http://127.0.0.1:5601/internal/apm/services?start=2026-09-01T00:00:00.000Z&end=2026-09-08T00:00:00.000Z&environment=ENVIRONMENT_ALL&kuery=&probability=1&documentType=serviceTransactionMetric&rollupInterval=1m&useDurationSummary=true" \
+  -H "kbn-xsrf: true"
 
-# Find a specific route's spans
-curl -s "http://127.0.0.1:9200/simpleapp-traces/_search?pretty" -H "Content-Type: application/json" -d '
-{"query": {"match": {"Name": "GET /api/entries"}}}'
-
-# Metrics — NOTE: unlike traces/logs, the exporter ignores the custom index name and
-# always uses its own OTel-native data stream instead (see CLAUDE.md's Step C note)
-curl -s "http://127.0.0.1:9200/_cat/indices?v" | grep metrics
-curl -s "http://127.0.0.1:9200/.ds-metrics-generic-default-*/_search?size=5&pretty"
-
-# Logs — same trace_id/span_id you'd see in the stdout JSON line, now queryable
-curl -s "http://127.0.0.1:9200/simpleapp-logs/_search?size=5&pretty"
-curl -s "http://127.0.0.1:9200/simpleapp-logs/_search?pretty" -H "Content-Type: application/json" -d '
-{"query": {"match": {"Body": "login_succeeded"}}}'
-
-# Or use Kibana at http://127.0.0.1:5601 (Discover) for a UI instead of curl.
+# Raw APM data streams, if you want to see what's actually stored
+curl -s "http://127.0.0.1:9200/_cat/indices?v" | grep apm
+curl -s "http://127.0.0.1:9200/.ds-traces-apm-default-*/_search?size=3&pretty"
 ```
 
-To watch the Collector's own view of what it's exporting (useful when debugging a
-pipeline, not app behavior):
+Logs are routed through APM Server too now (all three OTLP pipelines go through
+`otlphttp/elastic`), landing in `logs-apm.app.simpleapp-*` — the old
+`simpleapp-logs` index is frozen leftover data from before this change, not live:
+
+```bash
+curl -s "http://127.0.0.1:9200/.ds-logs-apm.app.simpleapp-default-*/_search?size=5&pretty"
+curl -s "http://127.0.0.1:9200/.ds-logs-apm.app.simpleapp-default-*/_search?pretty" -H "Content-Type: application/json" -d '
+{"query": {"match": {"message": "login_succeeded"}}}'   # APM Server maps to ECS-style
+                                                          # field names, not the raw OTel
+                                                          # "Body"/"Attributes" shape
+```
+
+To watch the Collector's or APM Server's own view of what's flowing through
+(useful when debugging the pipeline itself, not app behavior):
 
 ```bash
 docker compose logs -f otel-collector
+docker compose logs -f apm-server
 ```
 
 Stopping:
@@ -419,7 +433,7 @@ way to ship," which is called out explicitly where relevant.
 | **Native install first, Docker later** (Postgres native in Phase 3, containerized in Phase 6) | Deliberate ordering on the roadmap — understand what's *inside* the container (a real `systemd`-managed Postgres, manual role/db creation) before automating it away | Both are now visible side by side: `docker compose up` is one command vs. several `sudo` steps for the native install | The two Postgres instances are genuinely separate databases with separate data (§9) — a source of "why don't I see my entries" confusion if forgotten |
 | **Elastic export deferred from Phase 5 to Phase 6** | Running Elasticsearch (+Kibana +Collector) natively would've been heavy (~2GB+ RAM, several `sudo` steps) for something that became near-free as Compose services one phase later | Avoided doing real infrastructure work twice (once native, then redone in containers) — done once, done as Compose services (§9) | Traces + metrics now land in Elasticsearch when running via compose (§9); structured logs still don't (see the next row) — native dev is still console-only for all three, by design |
 | **Structured logs now shipped to Elasticsearch too** (Step C follow-up) | Closed the gap Step C deliberately left open, via an OTel logging bridge (`logging_config.py`) — no new dependency, same `OTEL_EXPORTER_OTLP_ENDPOINT` toggle | Traces, metrics, *and* logs are all in Elasticsearch now, all correlated by `trace_id` | Stdout JSON logging stays too (§5), as a second parallel output — not a replacement, so there are now two places a log line lives when running via compose |
-| **Discovered `mapping: mode: otel` is broken here, not used** | This is the config Elastic's native APM UI needs — tried it, and it broke every metric (`document_parsing_exception`, missing dynamic templates) with this exact `elasticsearchexporter` 0.113.0 + Elasticsearch 8.15.3 pairing | Caught before shipping it broken; reverted immediately | Real, unresolved upstream incompatibility, not a config mistake — see `CLAUDE.md`'s Step C follow-up note. This is *why* APM needs a real APM Server (next row), not just a config flag |
+| **Discovered `mapping: mode: otel` is broken, used a real APM Server instead** | The `elasticsearch` exporter's OTel mapping mode broke every metric (`document_parsing_exception`) with this `elasticsearchexporter` 0.113.0 + Elasticsearch 8.15.3 pairing — a real bug, not a config mistake. Rather than work around it, added a dedicated `apm-server` service and re-pointed the Collector at it (`otlphttp/elastic` exporter) | APM Server owns the OTel→Elastic-APM mapping itself (its actual job); Kibana's APM UI now genuinely works — real per-route latency (`POST /login` ~75ms, the scrypt cost, vs. `GET /healthz` ~2ms), and APM Server auto-computes rollup metrics (service summary, per-transaction stats) from raw traces | One more service to run; Service Map specifically needs an Elastic **Platinum** license (`403` on the free/basic tier this runs on) — not a bug, a real licensing wall |
 | **k8s manifests scoped to app + Postgres only** (Phase 6 Step D) | Elasticsearch/Kibana/Collector already proven via compose (§9) — re-deploying the whole observability stack a second time in `kind` would prove the same thing twice | Kept the `kind` cluster light (~400MB idle) and the step focused on the actual new thing: the deploy pattern itself (Secrets, probes, a migration Job) | A real k8s deployment of this app would need the full stack — this only proves the app+DB half of it works on Kubernetes |
 | **`kind` (Kubernetes-in-Docker) for testing, not a cloud cluster** | Free, local, fast to create/destroy (~30s), no cloud account or cost | Same verify-don't-just-write discipline as every other phase, with zero external dependency | `imagePullPolicy: Never` + `kind load docker-image` only works because there's no registry involved — a real cluster needs a real one (ECR/GCR/Docker Hub), which changes the image-distribution step non-trivially |
 
@@ -431,11 +445,9 @@ way to ship," which is called out explicitly where relevant.
 - No dependency vulnerability scanning.
 - No true SQL `NULL` tested anywhere — `notes` is non-NULL at both ORM and DB level;
   every other field is required. No optional-field design exists yet.
-- No native Kibana APM UI (service maps, latency breakdown) — traces/metrics/logs
-  are all in Elasticsearch and queryable, but `mapping: mode: otel` (what the APM
-  app needs) is broken with the current exporter/ES version pairing (see the
-  trade-offs row above). A dedicated APM Server is the real fix, not yet added.
-- k8s manifests don't include Elasticsearch/Kibana/Collector (Phase 6 Step D scope
-  — see the trade-offs row above).
+- Kibana's APM Service Map needs an Elastic Platinum license — `403` on the free/
+  basic tier this stack runs on (everything else in the APM UI works, see §9).
+- k8s manifests don't include Elasticsearch/Kibana/Collector/APM Server (Phase 6
+  Step D scope — see the trade-offs row above).
 - CI pipeline — later Phase 6 step.
 - Graceful shutdown beyond OTel flush, 12-factor config review, load testing — Phase 7.

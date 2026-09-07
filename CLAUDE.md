@@ -37,10 +37,11 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   needed since `psycopg2-binary` ships a prebuilt wheel
 - `docker-compose.yml`: app + Postgres 14 + a one-off `migrate` service
   (`alembic upgrade head`, `depends_on: service_completed_successfully`) +
-  Elasticsearch + Kibana + an OTel Collector (`otel-collector-config.yaml`);
-  `opentelemetry-exporter-otlp-proto-http` sends real traces+metrics to the
-  Collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (compose only — console
-  export still used for native dev)
+  Elasticsearch + Kibana + Elastic APM Server + an OTel Collector
+  (`otel-collector-config.yaml`) routing traces/metrics/logs to APM Server;
+  `opentelemetry-exporter-otlp-proto-http` sends real traces+metrics+logs to the
+  Collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (compose only — console/
+  stdout still used for native dev)
 - `k8s/` manifests (app + Postgres only — scoped, not the observability stack)
   tested against a local `kind` cluster
 
@@ -294,3 +295,20 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   types), a real incompatibility between `elasticsearchexporter` 0.113.0 and
   Elasticsearch 8.15.3. Reverted immediately rather than shipping it broken; this is
   why the next step reaches for a dedicated APM Server instead of that mapping mode.
+- **Phase 6, Step C follow-up 2 (done 2026-09-07)**: Elastic APM Server. New
+  `apm-server` compose service (`docker.elastic.co/apm/apm-server:8.15.3`,
+  `apm-server.auth.anonymous.enabled=true` for local dev — no secret token/API key
+  needed, matching Elasticsearch's own `xpack.security.enabled: false`); the
+  Collector's exporter changed from `elasticsearch` to `otlphttp/elastic` pointed at
+  `http://apm-server:8200`, letting APM Server own the OTel→Elastic-APM data-model
+  mapping itself (its actual job) instead of fighting the generic exporter's broken
+  `otel` mapping mode. Confirmed real APM data: Kibana's APM "Services" API
+  recognizes `simpleapp` (`agentName: opentelemetry/python`) with genuinely distinct
+  per-route latency (`POST /login` ~75ms — the scrypt cost — vs. `GET /healthz`
+  ~2ms), and APM Server auto-computes rollup metrics (service summary, per-
+  transaction latency/throughput, service-destination) directly from the raw trace
+  data — the actual point of running a real APM Server rather than a generic index.
+  Confirmed the old `elasticsearch`-exporter path is genuinely retired, not just
+  replaced in config, via a before/after document-count check. **Known limit, not a
+  bug**: the Service Map view returns `403` — it requires an Elastic Platinum
+  license, unavailable on the free/basic tier this stack runs on.

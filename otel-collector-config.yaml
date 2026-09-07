@@ -8,11 +8,12 @@ processors:
   batch: {}
 
 exporters:
-  elasticsearch:
-    endpoints: ["http://elasticsearch:9200"]
-    traces_index: simpleapp-traces
-    metrics_index: simpleapp-metrics
-    logs_index: simpleapp-logs
+  # Routed through Elastic's own APM Server, not the generic `elasticsearch`
+  # exporter — APM Server maps OTel data into Elastic's proper APM data model
+  # (what Kibana's APM UI actually reads), sidestepping the `mapping: mode: otel`
+  # bug found in the `elasticsearch` exporter (see CLAUDE.md's Step C follow-up).
+  otlphttp/elastic:
+    endpoint: http://apm-server:8200
   debug:
     verbosity: basic
 
@@ -21,12 +22,12 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [elasticsearch, debug]
+      exporters: [otlphttp/elastic, debug]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [elasticsearch, debug]
+      exporters: [otlphttp/elastic, debug]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [elasticsearch, debug]
+      exporters: [otlphttp/elastic, debug]

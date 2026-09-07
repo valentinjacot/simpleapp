@@ -53,7 +53,7 @@ running — find and kill it first: `pgrep -fa "uvicorn app:app"` then `kill <pi
 
 ## 3. First checks: is it alive?
 
-Two separate probes, on purpose (see §12 for why, and §11 to see it matter for real
+Two separate probes, on purpose (see §13 for why, and §12 to see it matter for real
 under Kubernetes):
 
 ```bash
@@ -421,7 +421,71 @@ difference between a working observability *setup* and a mature observability
 
 ---
 
-## 11. Running on Kubernetes (kind)
+## 11. The same telemetry, a second backend: Tempo/Loki/Prometheus/Grafana
+
+Everything in §10 came from Elastic. The Collector (`otel-collector-config.yaml`)
+sends the *exact same* OTLP data to a second, independent backend set at the same
+time — Tempo (traces), Loki (logs), Prometheus (metrics), Grafana (UI over all
+three). No code in `otel_setup.py`/`logging_config.py`/`app.py` knows either
+backend exists; adding a backend is purely a Collector-exporter-config change.
+Already part of `docker compose up` in §9 — nothing extra to start.
+
+**Grafana**: open **http://127.0.0.1:3000** (no login — anonymous admin access for
+local dev, same posture as the rest of this stack). Explore → pick a datasource:
+
+- **Tempo**: search by service name, click a trace for the same waterfall view
+  you'd see in Kibana APM, sourced from the same span data.
+- **Loki**: query `{service_name="simpleapp"}` in the Explore view (LogQL).
+- **Prometheus**: query `http_server_duration_milliseconds_count` or
+  `target_info` in the Explore view (PromQL).
+
+A trace's **Logs** button (in the Tempo trace view) jumps straight to that trace's
+logs in Loki — wired via the shared `service.name`/`service_name` attribute in
+`grafana/provisioning/datasources/datasources.yml`, the same resource attribute
+every backend in this stack keys off.
+
+**Prove it's the same data, not a second copy**, with a live trace ID:
+
+```bash
+# Grab a recent trace ID from Tempo — .zfill(32): Tempo's search API returns trace
+# IDs as a hex big-integer with leading zeros dropped, but Elasticsearch expects
+# the full zero-padded 32-char form. Without this, the lookup below finds nothing
+# and looks like the data's missing when it's actually just a padding mismatch.
+TRACE_ID=$(curl -s "http://127.0.0.1:3200/api/search?tags=service.name%3Dsimpleapp&limit=1" | python3 -c "
+import json, sys
+print(json.load(sys.stdin)['traces'][0]['traceID'].zfill(32))
+")
+echo "$TRACE_ID"
+
+# ...then look up that exact ID in Elasticsearch:
+curl -s "http://127.0.0.1:9200/.ds-traces-apm-default-*/_search?pretty" \
+  -H "Content-Type: application/json" -d "{\"query\": {\"term\": {\"trace.id\": \"$TRACE_ID\"}}}"
+```
+
+Same trace ID, two unrelated storage systems, zero app code aware of either.
+
+**How each backend keys its model off `service.name`/`service.version`/
+`deployment.environment`** — genuinely different per backend, not just a naming
+convention:
+
+| Backend | What happens to these attributes |
+|---|---|
+| Elastic APM | Flat fields: `service.version`, `service.environment` (from `deployment.environment`) — directly filterable in the Services list |
+| Tempo | Stored in full on every trace's resource, no filtering — search/UI keys off `service.name` |
+| Loki | Only `service_name`, `service_instance_id`, `deployment_environment` become **indexed labels**; `service_version` becomes **structured metadata** instead (queryable, not indexed) — a deliberate cardinality control, confirmed via `curl http://127.0.0.1:3100/loki/api/v1/labels` |
+| Prometheus | No resource-attribute concept at all — a synthetic `target_info` metric (value `1`) carries them as labels, joined to real metrics via `job`/`instance`; those two get renamed to `exported_job`/`exported_instance` since Prometheus's own scrape labels already own `job`/`instance` |
+
+Direct queries, if you want to see the raw shape without a UI:
+
+```bash
+curl -s "http://127.0.0.1:3200/api/search?tags=service.name%3Dsimpleapp&limit=5"
+curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" --data-urlencode 'query={service_name="simpleapp"}'
+curl -s -G "http://127.0.0.1:9090/api/v1/query" --data-urlencode 'query=target_info'
+```
+
+---
+
+## 12. Running on Kubernetes (kind)
 
 `k8s/` holds manifests for app + Postgres, scoped deliberately — Elasticsearch/
 Kibana/Collector stay on compose (§9); this is about the deploy pattern, not
@@ -512,7 +576,7 @@ kind delete cluster --name simpleapp
 
 ---
 
-## 12. Why it's built this way — choices, trade-offs, alternatives
+## 13. Why it's built this way — choices, trade-offs, alternatives
 
 Plain-English summary. This is a **learning project** (see `CLAUDE.md`'s Purpose) —
 several choices below deliberately favor "see how the real thing works" over "fastest

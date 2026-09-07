@@ -531,3 +531,61 @@ Findings:
 - Service Map's Platinum-license gate is a genuine trade-off of self-hosting the
   free/basic tier — a real production Elastic subscription (or Elastic Cloud) would
   unlock it; noted, not worked around.
+
+## Backend fan-out exercise: Grafana stack alongside Elastic (last run: 2026-09-07)
+
+Goal: prove backend choice is a Collector concern, not an application concern, by
+fanning the same telemetry out to a second, independent backend set without
+touching any application code. Added exporters to `otel-collector-config.yaml` one
+at a time (traces → metrics → logs → UI), verifying data landed and Elastic still
+worked after each addition, before moving to the next.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `OTEL_RESOURCE_ATTRIBUTES` env var merge test (before touching compose) | `service.version`/`deployment.environment` appear alongside the code-set `service.name`, no override | confirmed via direct Python test — all three present |
+| 2 | Resource attrs added to `app`'s compose env | Elastic still works; new attrs appear on ES documents | `service.version: "0.1.0"`, `service.environment: "development"` both present on a fresh APM trace doc |
+| 3 | `otlp/tempo` exporter added (traces) | trace lands in Tempo; Elastic unaffected | confirmed — **same trace ID** (`c8309dc985719c3f6110024597118288`) present in both Tempo's API and Elasticsearch simultaneously, with identical resource attributes in Tempo |
+| 4 | `otlphttp/loki` exporter added (logs) | log lands in Loki; Elastic/Tempo unaffected | confirmed via LogQL — real log content, `trace_id`/`span_id` present as structured metadata |
+| 5 | `prometheus` exporter added (metrics, pull-based) | Prometheus scrapes the collector successfully | target `up`, real `http_server_duration_milliseconds_count` series present |
+| 6 | Grafana added, datasources provisioned | Tempo/Loki/Prometheus all reachable from Grafana | Loki + Prometheus health checks `OK`; Tempo's health endpoint isn't implemented in this version (benign API gap) — confirmed real connectivity instead by querying Tempo *through* Grafana's own datasource proxy and getting real results |
+| 7 | Elastic re-checked after every step above | still fully healthy, still receiving data | confirmed each time — cluster green/yellow, Kibana 200, APM services list populated throughout |
+| 8 | `git status` after all changes | zero `.py` files modified | confirmed — only `docker-compose.yml`, `otel-collector-config.yaml`, and new non-code config files (`tempo.yaml`, `prometheus.yml`, `grafana/provisioning/`) |
+
+Findings:
+- The central claim is proven, not asserted: the same trace ID exists in two
+  independently-run backends because the Collector duplicated the same OTLP
+  payload to two exporters — nothing about `otel_setup.py`'s
+  `FastAPIInstrumentor`/`SQLAlchemyInstrumentor`/`OTLPSpanExporter` setup knows or
+  cares that a second backend exists.
+- `OTEL_RESOURCE_ATTRIBUTES` merging with the code-set `service.name` (rather than
+  one overriding the other) is standard OTel SDK behavior, not a lucky coincidence
+  — confirmed by reading the actual merged attribute set before relying on it.
+- Each backend's resource-attribute handling is genuinely different, confirmed by
+  inspecting real query results in each, not by reading documentation:
+  - **Elastic APM**: flat fields (`service.version`, `service.environment`), no
+    special handling.
+  - **Tempo**: full resource-attribute set stored per trace, no filtering.
+  - **Loki**: a small fixed set (`service_name`, `service_instance_id`,
+    `deployment_environment`) becomes *indexed labels*; everything else
+    (`service_version`, `trace_id`, `span_id`, all log-record attributes) becomes
+    *structured metadata* — queryable, but not part of the label index. A real
+    cardinality-control mechanism, not an oversight.
+  - **Prometheus**: has no resource-attribute concept — the exporter fabricates a
+    synthetic `target_info` metric (value `1`) carrying all resource attributes as
+    labels, joined to real metrics via `job`/`instance`; those two labels get
+    renamed to `exported_job`/`exported_instance` because Prometheus's own
+    scrape-target labels already claim `job`/`instance`.
+- Prometheus is pull-based, unlike every other exporter in this stack (push) — the
+  collector exposes a `/metrics` page (port `8889`) and Prometheus scrapes it
+  (`prometheus.yml`). Getting the dependency direction right in compose mattered:
+  `prometheus` depends on `otel-collector`, not the other way around.
+- Image versions pinned to what this project already had locally cached where
+  possible (`prom/prometheus:v2.55.1`, `grafana/grafana:11.2.2`, from an unrelated
+  earlier project on this machine) — zero extra pull time for those two.
+- **Real gotcha caught while writing the cross-backend verification script**:
+  Tempo's `/api/search` returns trace IDs as a hex big-integer with leading zeros
+  dropped (a 31-char ID for a value that starts with a zero nibble), but
+  Elasticsearch's `trace.id` field expects the full zero-padded 32-char form — a
+  direct copy-paste of Tempo's ID into an Elasticsearch query silently returns zero
+  hits, looking like the data's missing when it's actually a padding mismatch.
+  Fixed by zero-padding (`.zfill(32)`) before using the ID anywhere else.

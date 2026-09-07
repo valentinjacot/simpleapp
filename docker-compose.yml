@@ -37,6 +37,11 @@ services:
       APP_USERNAME: ${APP_USERNAME}
       APP_PASSWORD_HASH: ${APP_PASSWORD_HASH}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      # Standard OTel env var — merges into the SDK's Resource alongside the
+      # service.name already set in code (otel_setup.py/logging_config.py), no
+      # code change needed. This is a collector/config-layer concern, not an
+      # instrumentation one: every backend downstream sees the same three attrs.
+      OTEL_RESOURCE_ATTRIBUTES: "service.version=0.1.0,deployment.environment=development"
     ports:
       - "8000:8000"
     healthcheck:
@@ -89,6 +94,26 @@ services:
     ports:
       - "8200:8200"
 
+  # --- Grafana stack: fans out the SAME collector-received telemetry to a second,
+  # independent set of backends. None of these change anything upstream of the
+  # collector — the app's instrumentation code is untouched.
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempodata:/var/tempo
+    ports:
+      - "3200:3200"
+
+  loki:
+    image: grafana/loki:3.2.1
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - lokidata:/loki
+    ports:
+      - "3100:3100"
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.113.0
     command: ["--config=/etc/otel-collector-config.yaml"]
@@ -99,9 +124,51 @@ services:
         condition: service_healthy
       apm-server:
         condition: service_started
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
     ports:
       - "4318:4318"
+      - "8889:8889"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    depends_on:
+      otel-collector:
+        condition: service_started
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    environment:
+      # No login wall for local learning — matches xpack.security.enabled: false
+      # on Elasticsearch and apm-server.auth.anonymous.enabled=true elsewhere in
+      # this stack. Not for anything beyond local dev.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    ports:
+      - "3000:3000"
 
 volumes:
   pgdata:
   esdata:
+  tempodata:
+  lokidata:
+  promdata:
+  grafanadata:

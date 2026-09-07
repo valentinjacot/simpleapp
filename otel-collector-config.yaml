@@ -14,6 +14,21 @@ exporters:
   # bug found in the `elasticsearch` exporter (see CLAUDE.md's Step C follow-up).
   otlphttp/elastic:
     endpoint: http://apm-server:8200
+  # Fan-out target #1 (Grafana stack): Tempo, traces only. Elastic above is
+  # untouched — this is purely an additional exporter on the same pipeline.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  # Fan-out target #2 (Grafana stack): Loki, logs only, via its native OTLP
+  # ingestion endpoint (Loki 3.x). Elastic/APM Server above is untouched.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  # Fan-out target #3 (Grafana stack): Prometheus, metrics only. Pull-based —
+  # this exposes a /metrics page on the collector itself; Prometheus scrapes it
+  # (prometheus.yml). Elastic/APM Server above is untouched.
+  prometheus:
+    endpoint: 0.0.0.0:8889
   debug:
     verbosity: basic
 
@@ -22,12 +37,12 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/elastic, debug]
+      exporters: [otlphttp/elastic, otlp/tempo, debug]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/elastic, debug]
+      exporters: [otlphttp/elastic, prometheus, debug]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/elastic, debug]
+      exporters: [otlphttp/elastic, otlphttp/loki, debug]

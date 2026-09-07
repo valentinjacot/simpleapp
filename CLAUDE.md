@@ -37,8 +37,10 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   needed since `psycopg2-binary` ships a prebuilt wheel
 - `docker-compose.yml`: app + Postgres 14 + a one-off `migrate` service
   (`alembic upgrade head`, `depends_on: service_completed_successfully`) +
-  Elasticsearch + Kibana + Elastic APM Server + an OTel Collector
-  (`otel-collector-config.yaml`) routing traces/metrics/logs to APM Server;
+  Elasticsearch + Kibana + Elastic APM Server + a Grafana stack (Tempo/Loki/
+  Prometheus/Grafana) + an OTel Collector (`otel-collector-config.yaml`) fanning
+  the same traces/metrics/logs out to both backend sets — backend choice is a
+  Collector-config concern, no application code involved;
   `opentelemetry-exporter-otlp-proto-http` sends real traces+metrics+logs to the
   Collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (compose only — console/
   stdout still used for native dev)
@@ -312,3 +314,46 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   replaced in config, via a before/after document-count check. **Known limit, not a
   bug**: the Service Map view returns `403` — it requires an Elastic Platinum
   license, unavailable on the free/basic tier this stack runs on.
+- **Phase 6, backend fan-out exercise (done 2026-09-07)**: proved that *backend
+  choice is a Collector concern, not an application concern* — fanned the exact
+  same telemetry out to a second, independent set of backends (a local Grafana
+  stack: Tempo for traces, Loki for logs, Prometheus for metrics, Grafana as the
+  UI) by adding exporters to `otel-collector-config.yaml` only. **Zero application
+  code was touched** — not `otel_setup.py`, not `logging_config.py`, not `app.py`.
+  Verified by diffing what changed this session: only `docker-compose.yml`,
+  `otel-collector-config.yaml`, and new infra config files (`tempo.yaml`,
+  `prometheus.yml`, `grafana/provisioning/`). Elastic was never broken — checked
+  after every single addition, not just at the end.
+  - **`service.version`/`deployment.environment` needed no code change either**:
+    verified directly that `Resource.create({"service.name": "simpleapp"})`
+    (already in the code) *merges* with the standard `OTEL_RESOURCE_ATTRIBUTES` env
+    var rather than overriding it — so both attributes go on purely via that env
+    var on the `app` service in `docker-compose.yml`. This is the idiomatic OTel
+    pattern specifically for this situation: canonical resource attributes belong
+    in deployment config, not application code.
+  - **Added one exporter at a time, verified data landed before adding the next**:
+    `otlp/tempo` (traces) → confirmed the *same* trace ID existed in both Tempo and
+    Elasticsearch simultaneously with identical resource attributes; `otlphttp/loki`
+    (logs, via Loki's native OTLP endpoint) → confirmed via LogQL; `prometheus`
+    exporter (metrics, pull-based — Prometheus scrapes the collector's `/metrics`,
+    not the other way around) → confirmed via Prometheus's own query API; Grafana
+    last, with provisioned datasources for all three plus a Tempo→Loki
+    "traces to logs" link keyed on `service.name`.
+  - **How each backend keys its model off the shared resource attributes — verified,
+    not assumed**: Elastic APM maps `deployment.environment` straight to its own
+    `service.environment` field (filterable in the Services list) and
+    `service.version` to `service.version`, both plain, queryable fields on every
+    span. **Tempo** stores the full resource-attribute set on every trace and
+    searches by `service.name` (`rootServiceName` in its API) — no attribute
+    filtering, no cardinality limit. **Loki** promotes only a small, fixed set of
+    resource attributes to *indexed labels* (`service_name`, `service_instance_id`,
+    `deployment_environment`) — deliberately not `service_version`, which instead
+    rides along as *structured metadata* (queryable, not part of the label index) —
+    a real cardinality-control design decision, confirmed by querying
+    `/loki/api/v1/labels` directly. **Prometheus** doesn't have a resource-attribute
+    concept at all: the exporter fabricates a synthetic `target_info` metric
+    (value always `1`) carrying every resource attribute as a label, joined to real
+    metrics via shared `job`/`instance` labels — and since Prometheus's own
+    scrape-target `job`/`instance` labels take priority, the OTel-derived ones get
+    renamed to `exported_job`/`exported_instance` to avoid colliding, confirmed by
+    inspecting an actual query result.

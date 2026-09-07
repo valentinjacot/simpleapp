@@ -285,3 +285,39 @@ Findings:
   real load. Also noted: metrics export interval was shortened to 5s from the SDK's
   60s default purely for local-testing convenience — a production deployment would
   leave it at (or near) the default.
+
+## Phase 6, Step A results (Dockerfile, last run: 2026-09-07)
+
+Built the image (`docker build -t simpleapp:dev .`) and ran it standalone
+(`docker run`, `--add-host=host.docker.internal:host-gateway`, `DATABASE_URL`
+pointed at the existing native Postgres) to verify the image itself before
+introducing compose. Non-DB routes tested with plain curl; DB-dependent routes
+tested with `curl --max-time 5` since the DB call was expected to hang, not fail
+fast (see finding below) — a bare `curl` with no timeout would have looked stuck.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `docker build` | succeeds, non-root `appuser`, image runs `uvicorn` on `0.0.0.0:8000` | succeeded |
+| 2 | Container startup logs | same structured JSON logging as native, uvicorn lines included | present, correctly formatted |
+| 3 | `GET /healthz` (no DB) | 200 | 200 |
+| 4 | `POST /login` (no DB — hash comparison only) | 200, `{"ok": true}` | 200 |
+| 5 | `GET /readyz` (needs DB) | 200 or 503 | **hung** — see finding |
+| 6 | `GET /api/entries` (needs DB) | 200 | **hung** — see finding |
+
+Findings:
+- **Expected limitation, not a bug**: the container could not reach the native
+  Postgres via `host.docker.internal`. Native Postgres listens on `localhost` only
+  by default (not on the Docker bridge gateway IP), and the connection attempt hung
+  rather than failing fast — consistent with a firewall/network layer silently
+  dropping the packets rather than the OS returning "connection refused." This is a
+  well-known Docker-to-host networking gotcha, not something to fix in the
+  Dockerfile — Step B's compose setup puts the app and Postgres on the same Docker
+  network, which sidesteps this class of problem entirely rather than working
+  around it.
+- Everything not touching the DB (routing, auth hash check, structured JSON
+  logging, OTel console output) worked identically to the native run — confirms the
+  image itself, not just the app's Python code, behaves correctly.
+- `pip install` inside the build prints the usual "Running pip as the 'root' user"
+  warning — expected and harmless in a container build (each container is an
+  isolated, disposable filesystem; there's no host system package manager to
+  conflict with), not a real issue.

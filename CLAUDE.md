@@ -33,6 +33,8 @@ Optimize for MY understanding, not for shipping fast or being impressive.
 - OpenTelemetry SDK for traces + metrics (`otel_setup.py`); auto-instrumentation for
   FastAPI and SQLAlchemy; console exporters for now (real backend export deferred to
   Phase 6, alongside Elasticsearch/Kibana/Collector as compose services)
+- `Dockerfile` (single-stage, non-root `appuser`, `python:3.13-slim`); no compiler
+  needed since `psycopg2-binary` ships a prebuilt wheel
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
@@ -182,3 +184,18 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   export wiring should be small: `otel_setup.py`'s exporters are already isolated to
   two lines, swapping `ConsoleSpanExporter`/`ConsoleMetricExporter` for OTLP exporters
   pointed at the Collector.
+- **Phase 6, Step A (done 2026-09-07)**: `Dockerfile`. Single-stage build — no
+  multi-stage needed since `psycopg2-binary` is a prebuilt wheel, nothing to compile.
+  Runs as a non-root `appuser` (cheap, real security win: a container escape doesn't
+  hand over root). `requirements.txt` copied and installed before the rest of the
+  source, so `docker build` only reinstalls dependencies when they actually change,
+  not on every code edit. Verified by running the built image standalone
+  (`--add-host=host.docker.internal:host-gateway`, pointed at the existing native
+  Postgres) before adding compose complexity. **Real finding, not a bug**: the
+  container couldn't reach that native Postgres — the connection attempt hung rather
+  than failing fast, because native Postgres only listens on `localhost` by default,
+  not the Docker bridge gateway IP. Confirmed the image itself was fine by checking
+  routes that don't touch the DB (`/healthz`, `/login`) worked identically to the
+  native run. Deliberately not "fixed" here — Step B's compose setup puts the app and
+  Postgres on the same Docker network, which sidesteps this whole class of problem
+  rather than working around the host-networking gap.

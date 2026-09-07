@@ -217,30 +217,43 @@ rm -f "$COOKIES"
 
 ## 9. Running via Docker Compose (alternative to §1–§2)
 
-`docker-compose.yml` runs the app and Postgres as containers on their own network —
-no native Postgres, no `.venv`, no `alembic upgrade head` by hand. This is a
-**separate, empty database** from the native one in §1 (see `CLAUDE.md`'s Phase 6
-Step B note) — entries created here won't show up in the native setup, or vice versa.
+`docker-compose.yml` runs the app, Postgres, Elasticsearch, Kibana, and an OTel
+Collector as containers on their own network — no native Postgres, no `.venv`, no
+`alembic upgrade head` by hand, and (unlike native dev) traces/metrics go to a real
+backend instead of the console. This is a **separate, empty database** from the
+native one in §1 (see `CLAUDE.md`'s Phase 6 Step B note) — entries created here
+won't show up in the native setup, or vice versa.
+
+**One-time host prerequisite** (Elasticsearch requires this; it isn't `sudo`-able
+from inside a container):
+
+```bash
+sudo sysctl -w vm.max_map_count=262144   # only lasts until reboot; add the same line
+                                          # to /etc/sysctl.conf to make it permanent
+```
 
 ```bash
 docker compose up -d --build
 ```
 
-This builds the app image, starts Postgres, waits for it to report healthy, runs
-`alembic upgrade head` in a one-off `migrate` container, then starts the app — only
-once `migrate` exits successfully. Check it worked:
+This builds the app image, starts Postgres and Elasticsearch in parallel, waits for
+both to report healthy, runs `alembic upgrade head` in a one-off `migrate` container
+and starts the OTel Collector, then starts the app — only once `migrate` exits
+successfully. Check it worked:
 
 ```bash
-docker compose ps                    # both db and app should show "(healthy)"
-docker compose logs migrate          # should show "Running upgrade -> ... create
-                                      # entries table" on the very first run, and
-                                      # nothing on subsequent runs (already migrated)
+docker compose ps                    # db, elasticsearch, app should show "(healthy)"
+docker compose logs migrate          # "Running upgrade -> ... create entries table"
+                                      # on the very first run, nothing on later runs
+curl http://127.0.0.1:9200/_cluster/health?pretty   # "status": "green" or "yellow"
+curl http://127.0.0.1:5601/api/status               # Kibana; 200 once ready (can take
+                                                      # a bit longer than the others)
 ```
 
-Everything in §3, §4, §6, and §7 above works exactly the same against
+Everything in §3, §4, and §7 above works exactly the same against
 `http://127.0.0.1:8000` — the app doesn't know or care whether it's containerized.
-Only the logging/tracing commands in §5–§6 change slightly, since output goes to
-`docker compose logs` instead of a redirected file:
+§5's log commands change slightly, since output goes to `docker compose logs`
+instead of a redirected file:
 
 ```bash
 # --no-log-prefix: compose normally prefixes each line with "app-1  | ", which
@@ -249,12 +262,40 @@ docker compose logs --no-log-prefix -f app | jq .
 docker compose logs --no-log-prefix app | jq -c 'select(.message == "request")'
 ```
 
+**§6 (traces/metrics) works completely differently here** — the app no longer prints
+spans/metrics to its own stdout at all (that's the point: `OTEL_EXPORTER_OTLP_ENDPOINT`
+switches `otel_setup.py` to real OTLP export). Read them from Elasticsearch instead:
+
+```bash
+# Traces — the Collector is configured to send these to a named index
+curl -s "http://127.0.0.1:9200/simpleapp-traces/_search?size=5&pretty"
+
+# Find a specific route's spans
+curl -s "http://127.0.0.1:9200/simpleapp-traces/_search?pretty" -H "Content-Type: application/json" -d '
+{"query": {"match": {"Name": "GET /api/entries"}}}'
+
+# Metrics — NOTE: unlike traces, the exporter ignores the custom index name and
+# always uses its own OTel-native data stream instead (see CLAUDE.md's Step C note)
+curl -s "http://127.0.0.1:9200/_cat/indices?v" | grep metrics
+curl -s "http://127.0.0.1:9200/.ds-metrics-generic-default-*/_search?size=5&pretty"
+
+# Or use Kibana at http://127.0.0.1:5601 (Discover, against the simpleapp-traces
+# index pattern / the metrics-generic-default data stream) for a UI instead of curl.
+```
+
+To watch the Collector's own view of what it's exporting (useful when debugging a
+pipeline, not app behavior):
+
+```bash
+docker compose logs -f otel-collector
+```
+
 Stopping:
 
 ```bash
 docker compose down       # stops and removes containers/network; DATA IS KEPT
-                           # (the pgdata volume survives)
-docker compose down -v    # also deletes the volume — genuinely fresh next time
+                           # (the pgdata and esdata volumes survive)
+docker compose down -v    # also deletes both volumes — genuinely fresh next time
 ```
 
 ---
@@ -275,9 +316,11 @@ way to ship," which is called out explicitly where relevant.
 | **Single-user design** | This literally is one person's training log (see `CLAUDE.md` Purpose) | Authz collapses to "must be logged in" — no per-resource permission logic to get wrong | Not multi-tenant: no `users` table, no `entries.user_id` FK, no per-user data isolation — would need adding before a second real user ever touched it |
 | **`SameSite=Lax` + `HttpOnly` cookie, security headers** (Phase 4) | Standard, low-effort CSRF/XSS/clickjacking mitigations that don't need a library | Meaningful protection for near-zero code | Not a substitute for rate limiting on `/login` (still absent, deferred to Phase 7) or HTTPS (deferred to Phase 6/7 — needs a reverse proxy) |
 | **Stdlib `logging` + custom JSON formatter** over a logging library | `extra={...}` already does everything needed; one less dependency | Full control, no library API to learn, easy to read (`logging_config.py` is ~45 lines) | A library like `structlog` would add contextvars-based automatic context propagation (e.g. request ID threaded through without passing it explicitly everywhere) |
-| **OTel auto-instrumentation + console exporters** (Phase 5, Step C) | Auto-instrumentation (`FastAPIInstrumentor`, `SQLAlchemyInstrumentor`) needs zero manual span code; console output needs no backend to stand up yet | See a real trace (request span → nested DB-query span) and real metrics locally, immediately, with no infrastructure | Console output isn't searchable, isn't retained, and isn't what you'd actually run — it's a deliberate stepping stone to real OTLP export (Phase 6) |
+| **OTel auto-instrumentation** (Phase 5, Step C) | Auto-instrumentation (`FastAPIInstrumentor`, `SQLAlchemyInstrumentor`) needs zero manual span code anywhere in `app.py`/`db.py` | A request span with a nested DB-query span appears for free, in both the native (console) and compose (real backend) paths | Only covers HTTP routes and SQL queries — anything else worth tracing (a slow external call, a background job) would still need a manual span |
+| **Console exporters natively, real OTLP export in compose** (Phase 5 Step C → Phase 6 Step C) | No backend needed for native dev; compose has one, so use it | See a real trace immediately with zero infrastructure locally; see the same data actually land in Elasticsearch/Kibana when running via compose — same code, `OTEL_EXPORTER_OTLP_ENDPOINT` env var is the only difference | The Collector's `elasticsearch` exporter is explicitly marked "Development component. May change in the future." in its own logs, and silently dropped every histogram metric until `otel_setup.py` was fixed to request delta temporality (see `CLAUDE.md`'s Phase 6 Step C note) — real backends have real rough edges a console exporter never surfaces |
 | **Native install first, Docker later** (Postgres native in Phase 3, containerized in Phase 6) | Deliberate ordering on the roadmap — understand what's *inside* the container (a real `systemd`-managed Postgres, manual role/db creation) before automating it away | Both are now visible side by side: `docker compose up` is one command vs. several `sudo` steps for the native install | The two Postgres instances are genuinely separate databases with separate data (§9) — a source of "why don't I see my entries" confusion if forgotten |
-| **Elastic export deferred to Phase 6** (not done in Phase 5) | Running Elasticsearch (+Kibana +Collector) natively is heavy (~2GB+ RAM, several `sudo` steps) for something that becomes near-free as Compose services next phase | Avoids doing real infrastructure work twice (once native, then redone in containers) | Phase 5's traces/metrics/logs are console-only until Phase 6 — not yet centrally searchable |
+| **Elastic export deferred from Phase 5 to Phase 6** | Running Elasticsearch (+Kibana +Collector) natively would've been heavy (~2GB+ RAM, several `sudo` steps) for something that became near-free as Compose services one phase later | Avoided doing real infrastructure work twice (once native, then redone in containers) — done once, done as Compose services (§9) | Traces + metrics now land in Elasticsearch when running via compose (§9); structured logs still don't (see the next row) — native dev is still console-only for all three, by design |
+| **Structured logs not (yet) shipped to Elasticsearch** | Phase 6 Step C scoped to what `otel_setup.py` already owned — traces + metrics — not logs, to keep that step reviewable | No scope creep into a different subsystem (`logging_config.py`) for one step | Real gap, not closed: getting logs into Elasticsearch too needs a separate mechanism (an OTel Python logging bridge, or a Collector `filelog` receiver on stdout) — not built yet |
 
 ### Known gaps, deferred on purpose (not forgotten)
 
@@ -286,5 +329,7 @@ way to ship," which is called out explicitly where relevant.
 - No dependency vulnerability scanning.
 - No true SQL `NULL` tested anywhere — `notes` is non-NULL at both ORM and DB level;
   every other field is required. No optional-field design exists yet.
-- Elastic export, Docker/Compose, k8s manifests, CI — Phase 6.
+- Structured logs aren't shipped to Elasticsearch (traces/metrics are, as of Phase 6
+  Step C) — still console/stdout-only.
+- k8s manifests, CI pipeline — later Phase 6 steps.
 - Graceful shutdown beyond OTel flush, 12-factor config review, load testing — Phase 7.

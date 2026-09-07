@@ -357,3 +357,51 @@ Findings:
   `/healthz`, not `curl` — the `python:3.13-slim` base image doesn't include `curl`,
   and Python's stdlib already can do the job without adding a package just for a
   healthcheck.
+
+## Phase 6, Step C results (Elasticsearch + Kibana + OTel Collector, last run: 2026-09-07)
+
+Added `elasticsearch`, `kibana`, `otel-collector` to compose; switched `otel_setup.py`
+to real OTLP export (to the Collector) whenever `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
+console export otherwise — so native `uvicorn --reload` dev is unaffected. Verified
+with `docker compose up -d --build`, then generated traffic and inspected Elasticsearch
+directly via its REST API (`curl http://127.0.0.1:9200/...`), not just the Collector's
+own logs, to confirm the data genuinely landed, not just that it was sent.
+
+| # | Case | Expected | Actual |
+|---|------|----------|--------|
+| 1 | `elasticsearch` startup | reports `(healthy)` via `_cluster/health` (green/yellow) | healthy |
+| 2 | `otel-collector` startup | starts, OTLP HTTP receiver listening on `:4318` | started, listening |
+| 3 | `app` startup with `OTEL_EXPORTER_OTLP_ENDPOINT` set | **no** console span/metric JSON blobs on stdout (confirms OTLP path taken, not console fallback) | confirmed — clean stdout |
+| 4 | `GET /healthz` after login | generates a trace | `simpleapp-traces` index in ES: 19+ docs, real span docs (`TraceId`, `SpanId`, `Name`, `Duration`, etc.) |
+| 5 | `http.server.duration` (a histogram metric) | lands in ES with real bucket data | confirmed: `"duration": {"counts": [1], "values": [2.5]}` on a real document |
+| 6 | `GET /api/status` on Kibana | 200 | 200 |
+
+Findings:
+- **Real bug caught and fixed**: the Collector's `elasticsearch` exporter rejected
+  every histogram metric (`http.server.duration`, `http.server.request.size`,
+  `http.server.response.size`) with `dropping cumulative temporality histogram` —
+  the SDK's default histogram temporality (cumulative) isn't accepted by this
+  exporter, only delta. Fixed in `otel_setup.py` by passing
+  `preferred_temporality={Histogram: AggregationTemporality.DELTA}` to
+  `OTLPMetricExporter` (OTLP-path only — console path unaffected). Confirmed fixed:
+  no more warnings in the Collector's own logs after the change, and the histogram
+  data is now visibly present in Elasticsearch with real `counts`/`values` buckets.
+- **Real, undocumented-until-tested behavior**: the exporter's `metrics_index:
+  simpleapp-metrics` config setting was **not** honored — metrics landed under the
+  exporter's own OTel-native default data stream name
+  (`.ds-metrics-generic-default-<date>-000001`) regardless. Traces *did* respect
+  `traces_index: simpleapp-traces`. Not fixed — noting it as-is rather than fighting
+  the exporter's default behavior for a learning app; worth knowing if searching for
+  metrics in Kibana later ("simpleapp-metrics" won't exist, "metrics-generic-default"
+  will).
+- Confirmed the exporter is explicitly marked `Development component. May change in
+  the future.` in its own startup log — a real caveat for anyone building on this,
+  not just this project's simplification.
+- Scope check confirmed: structured JSON logs (`logging_config.py`) are **not**
+  included in this OTLP pipeline — they still go to stdout only. Shipping them to
+  Elasticsearch too would need a separate mechanism (an OTel Python logging bridge,
+  or a Collector `filelog` receiver on the container's stdout) — noted as a known
+  gap, not built here, to keep this step scoped to what `otel_setup.py` already owns
+  (traces + metrics).
+- Cleaned up with `docker compose down -v` after testing so the Postgres and
+  Elasticsearch volumes are empty again for the first real run.

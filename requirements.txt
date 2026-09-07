@@ -9,3 +9,4 @@ itsdangerous
 opentelemetry-sdk
 opentelemetry-instrumentation-fastapi
 opentelemetry-instrumentation-sqlalchemy
+opentelemetry-exporter-otlp-proto-http

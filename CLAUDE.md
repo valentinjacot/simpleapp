@@ -36,8 +36,11 @@ Optimize for MY understanding, not for shipping fast or being impressive.
 - `Dockerfile` (single-stage, non-root `appuser`, `python:3.13-slim`); no compiler
   needed since `psycopg2-binary` ships a prebuilt wheel
 - `docker-compose.yml`: app + Postgres 14 + a one-off `migrate` service
-  (`alembic upgrade head`, `depends_on: service_completed_successfully`) — real
-  Elasticsearch/Kibana/Collector services land in a later Phase 6 step
+  (`alembic upgrade head`, `depends_on: service_completed_successfully`) +
+  Elasticsearch + Kibana + an OTel Collector (`otel-collector-config.yaml`);
+  `opentelemetry-exporter-otlp-proto-http` sends real traces+metrics to the
+  Collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (compose only — console
+  export still used for native dev)
 
 ## Roadmap (current phase marked)
 1. Minimal app: one HTML form, POST endpoint, SQLite write, list view — done 2026-08-28
@@ -223,3 +226,29 @@ Optimize for MY understanding, not for shipping fast or being impressive.
   `.env`, since the native and compose databases are deliberately different
   targets. Compose's own Postgres is **not** published to the host — only `app`'s
   port 8000 is — so it can't collide with the native Postgres on 5432.
+- **Phase 6, Step C (done 2026-09-07)**: Elasticsearch + Kibana + an OTel Collector
+  join compose, closing out Phase 5's deferred "export to Elastic." New dependency
+  `opentelemetry-exporter-otlp-proto-http` (official OTel package; the HTTP/protobuf
+  variant, not gRPC, to avoid a `grpcio` native dependency for something this small).
+  `otel_setup.py` now checks `OTEL_EXPORTER_OTLP_ENDPOINT`: if set (compose only),
+  spans/metrics go via `BatchSpanProcessor`/`OTLPSpanExporter`/`OTLPMetricExporter`
+  to the Collector; if unset (native `uvicorn --reload` dev), the Step C console
+  exporters are unchanged — so the existing native workflow in `Runbook.md` keeps
+  working exactly as before. **Real bug caught and fixed**: the Collector's
+  `elasticsearch` exporter silently dropped every histogram metric
+  (`http.server.duration` etc.) with `dropping cumulative temporality histogram` —
+  it only accepts delta temporality, not the SDK's cumulative default. Fixed with
+  `OTLPMetricExporter(preferred_temporality={Histogram: AggregationTemporality.DELTA})`.
+  Verified traces and metrics actually land in Elasticsearch by querying its REST API
+  directly (`curl :9200/...`), not just trusting the Collector's own logs — found a
+  real histogram document with populated `counts`/`values` buckets. **Real, noted
+  behavior**: the exporter's `metrics_index` config setting is ignored — metrics land
+  under its own default OTel-native data stream name regardless; `traces_index` *is*
+  respected. **Deliberately out of scope**: structured JSON logs (`logging_config.py`)
+  are not part of this OTLP pipeline — still stdout-only. Shipping them to
+  Elasticsearch too needs a separate mechanism (an OTel Python logging bridge, or a
+  Collector `filelog` receiver on stdout), left as a known gap rather than expanding
+  this step beyond what `otel_setup.py` already owns (traces + metrics). Host
+  prerequisite: Elasticsearch requires `vm.max_map_count >= 262144` — the user raised
+  it via `sudo sysctl -w vm.max_map_count=262144` in their own terminal (same
+  `sudo`/no-TTY pattern as the Phase 3 Postgres install).
